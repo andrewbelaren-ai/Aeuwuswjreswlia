@@ -104,6 +104,15 @@ def init_db():
         user_id INTEGER PRIMARY KEY, quantity INTEGER DEFAULT 0, last_extract REAL DEFAULT 0
     )''')
 
+    # Добыча других ресурсов (аналог нефтекачек)
+    c.execute('''CREATE TABLE IF NOT EXISTS user_resource_buildings (
+        user_id INTEGER,
+        resource TEXT,
+        quantity INTEGER DEFAULT 0,
+        last_extract REAL DEFAULT 0,
+        PRIMARY KEY (user_id, resource)
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS tech_types (
         name TEXT PRIMARY KEY, display_name TEXT, max_level INTEGER DEFAULT 5,
         ep_cost_per_level INTEGER, description TEXT, effect TEXT
@@ -191,24 +200,51 @@ def init_db():
 
     # --- Технологии ---
     techs = [
-        ('finance',    '💹 Финансы',          5, 100, '+10% к доходу /cash за уровень',          '+10%cash'),
-        ('logistics',  '🚛 Логистика',        5, 150, '-10% к содержанию армии за уровень',      '-10%maint'),
-        ('metallurgy', '🔩 Металлургия',       5, 200, '-8% к расходу Стали при крафте',          '-8%steel'),
-        ('engineering','⚙️ Инженерия',        5, 200, '-8% к денежному расходу при крафте',      '-8%money'),
-        ('military_sc','🎖️ Военная наука',    5, 250, '+15% к боевой мощи за уровень',           '+15%power'),
-        ('industry',   '🏗️ Индустриализация', 5, 180, '+20% к генерации ОЭ за уровень',          '+20%EP'),
-        ('energy',     '⚡ Энергетика',       5, 220, '-10% к расходу топлива за уровень',       '-10%fuel'),
-        ('trading',    '🤝 Торговля',         3, 150, '-1% комиссия на бирже за уровень',         '-1%fee'),
-        ('espionage',  '🕵️ Разведка',         3, 300, 'Расширенные возможности разведки',        'spy'),
-        ('naval',      '⚓ Морское дело',      5, 250, '+20% к мощи флота за уровень',            '+20%navy'),
-        ('morale_tech','🎺 Политработа',      5, 180, '+5% морали за уровень, -5% дезертирства', '+morale'),
+        ('finance',    '💹 Финансы',          5, 300,  '+10% к доходу /cash за уровень',          '+10%cash'),
+        ('logistics',  '🚛 Логистика',        5, 450,  '-10% к содержанию армии за уровень',      '-10%maint'),
+        ('metallurgy', '🔩 Металлургия',       5, 600,  '-8% к расходу Стали при крафте',          '-8%steel'),
+        ('engineering','⚙️ Инженерия',        5, 600,  '-8% к денежному расходу при крафте',      '-8%money'),
+        ('military_sc','🎖️ Военная наука',    5, 750,  '+15% к боевой мощи за уровень',           '+15%power'),
+        ('industry',   '🏗️ Индустриализация', 5, 540,  '+20% к генерации ОЭ за уровень',          '+20%EP'),
+        ('energy',     '⚡ Энергетика',       5, 660,  '-10% к расходу топлива за уровень',       '-10%fuel'),
+        ('trading',    '🤝 Торговля',         3, 450,  '-1% комиссия на бирже за уровень',         '-1%fee'),
+        ('espionage',  '🕵️ Разведка',         3, 900,  'Расширенные возможности разведки',        'spy'),
+        ('naval',      '⚓ Морское дело',      5, 750,  '+20% к мощи флота за уровень',            '+20%navy'),
+        ('morale_tech','🎺 Политработа',      5, 540,  '+5% морали за уровень, -5% дезертирства', '+morale'),
     ]
     c.executemany('INSERT OR IGNORE INTO tech_types VALUES (?,?,?,?,?,?)', techs)
+
+    # Обновить цены технологий если они изменились
+    for row in techs:
+        c.execute("UPDATE tech_types SET ep_cost_per_level=? WHERE name=?", (row[3], row[0]))
 
     conn.commit()
     conn.close()
 
 init_db()
+
+# Требования технологий для производства юнитов
+# формат: unit_name -> [(tech_name, min_level), ...]
+UNIT_TECH_REQUIREMENTS = {
+    'artillery':  [('military_sc', 1)],
+    'aa_gun':     [('military_sc', 1)],
+    'mlrs':       [('military_sc', 2)],
+    'missile':    [('military_sc', 4)],
+    'bomber':     [('military_sc', 1)],
+    'submarine':  [('naval', 2)],
+    'cruiser':    [('naval', 3)],
+    'carrier':    [('naval', 4)],
+    'nuclear_sub':[('naval', 5), ('military_sc', 3)],
+}
+
+# Конфигурация ресурсных зданий
+# resource -> (emoji, display_name, yield_per_building, cooldown_seconds)
+RESOURCE_BUILDINGS = {
+    'gold':  ('🥇', 'Золотой рудник',       1, 14400),  # 4ч
+    'steel': ('⚙️', 'Сталелитейный завод',  2, 10800),  # 3ч
+    'coal':  ('🪨', 'Угольная шахта',        3, 7200),   # 2ч
+    'aur':   ('💎', 'Аурит-шахта',           1, 21600),  # 6ч
+}
 
 # ==============================================================
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -321,7 +357,9 @@ def ep_gen():
         for uid, last_ep in (db_query("SELECT user_id,last_ep FROM users") or []):
             if uid in ep_map and (now - (last_ep or 0)) >= EP_INT:
                 bonus = 1 + get_tech(uid, 'industry') * 0.20
-                gain = int(ep_map[uid] * bonus)
+                base_gain = ep_map[uid] * bonus
+                # Случайное отклонение ±10%
+                gain = int(base_gain * random.uniform(0.90, 1.10))
                 if gain > 0:
                     db_query("UPDATE users SET ep=ep+?, last_ep=? WHERE user_id=?", (gain, now, uid))
 
@@ -503,6 +541,7 @@ def cmd_start(message):
         "/accept ID - принять сделку\n"
         "/canceltrade ID - отменить сделку\n\n"
         "🛢️ /extractoil - добыть нефть\n"
+        "⛏️ /extract [gold|steel|coal|aur] - добыть ресурс\n"
         "🔬 /tech | /researchtech\n"
         "📋 /events - последние события\n"
         "🏆 /top | /toparmy | /worldstats",
@@ -637,7 +676,7 @@ def cmd_extractoil(message):
     if is_banned(uid): return
     ext = db_query("SELECT quantity,last_extract FROM user_extractors WHERE user_id=?", (uid,), fetchone=True)
     if not ext or ext[0] <= 0:
-        return bot.reply_to(message, "У вас нет нефтекачек. Выдаются администрацией как привилегия страны.")
+        return bot.reply_to(message, "В вашей стране нет источника нефти.")
     qty, last = ext
     now = time.time()
     if now - (last or 0) < 3600:
@@ -647,7 +686,66 @@ def cmd_extractoil(message):
     add_asset(uid, 'oil', qty)
     total = (db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='oil'",
                       (uid,), fetchone=True) or [0])[0]
-    bot.reply_to(message, f"🛢️ Добыто *{qty}* нефти!\nВсего нефти: {total:.1f}", parse_mode="Markdown")
+    bot.reply_to(message,
+        f"🛢️ Добыто *{qty}* нефти ({qty} качек x 1)\nВсего нефти: {total:.1f}",
+        parse_mode="Markdown")
+
+@bot.message_handler(commands=['extract'])
+@group_only
+def cmd_extract(message):
+    """Добыча ресурсов из зданий: /extract gold|steel|coal|aur"""
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    args = message.text.split()
+
+    if len(args) < 2:
+        text = "⛏️ *Добыча ресурсов:*\n\n"
+        for res, (emoji, name, yld, cd) in RESOURCE_BUILDINGS.items():
+            row = db_query("SELECT quantity,last_extract FROM user_resource_buildings WHERE user_id=? AND resource=?",
+                           (uid, res), fetchone=True)
+            qty = row[0] if row else 0
+            last = row[1] if row else 0
+            now = time.time()
+            if qty > 0:
+                if now - (last or 0) < cd:
+                    left = int(cd - (now - last))
+                    cd_str = f"{left//3600}ч {(left%3600)//60}м" if left >= 3600 else f"{left//60}м {left%60}с"
+                    ready = f"готово через {cd_str}"
+                else:
+                    ready = f"✅ готово! +{qty*yld} {emoji}"
+                text += f"{emoji} *{name}*: {qty} шт. - {ready}\n"
+            else:
+                text += f"{emoji} *{name}* (`/extract {res}`): нет зданий\n"
+        text += "\nИспользование: `/extract [ресурс]`"
+        return bot.reply_to(message, text, parse_mode="Markdown")
+
+    res = args[1].lower()
+    if res not in RESOURCE_BUILDINGS:
+        return bot.reply_to(message,
+            f"Неизвестный ресурс. Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
+
+    emoji, name, yld, cd = RESOURCE_BUILDINGS[res]
+    row = db_query("SELECT quantity,last_extract FROM user_resource_buildings WHERE user_id=? AND resource=?",
+                   (uid, res), fetchone=True)
+    if not row or row[0] <= 0:
+        return bot.reply_to(message, f"В вашей стране нет источника {name.lower()}.")
+
+    qty, last = row
+    now = time.time()
+    if now - (last or 0) < cd:
+        left = int(cd - (now - last))
+        cd_str = f"{left//3600}ч {(left%3600)//60}м" if left >= 3600 else f"{left//60}м {left%60}с"
+        return bot.reply_to(message, f"Следующая добыча через {cd_str}.")
+
+    gained = qty * yld
+    db_query("UPDATE user_resource_buildings SET last_extract=? WHERE user_id=? AND resource=?",
+             (now, uid, res))
+    add_asset(uid, res, gained)
+    total = (db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?",
+                      (uid, res), fetchone=True) or [0])[0]
+    bot.reply_to(message,
+        f"{emoji} Добыто *{gained}* ({qty} зданий x {yld})\nВсего {name.split()[0].lower()}: {total:.1f}",
+        parse_mode="Markdown")
 
 # --- Технологии ---
 @bot.message_handler(commands=['tech'])
@@ -735,7 +833,17 @@ def cmd_craft(message):
                 fuel_str = ""
                 if oil_pu > 0:  fuel_str = f" | 🛢️{oil_pu}/3ч"
                 if coal_pu > 0: fuel_str = f" | 🪨{coal_pu}/3ч"
-                text += f"  {disp} (`{name}`) - {steel}⚙️ + {money:,}💰{fuel_str}\n"
+                req_str = ""
+                if name in UNIT_TECH_REQUIREMENTS:
+                    reqs = []
+                    for tname, tlv in UNIT_TECH_REQUIREMENTS[name]:
+                        trow = db_query("SELECT display_name FROM tech_types WHERE name=?", (tname,), fetchone=True)
+                        tdisp = trow[0].split()[-1] if trow else tname
+                        cur = get_tech(uid, tname)
+                        ok = "✅" if cur >= tlv else "❌"
+                        reqs.append(f"{ok}{tdisp}Ур.{tlv}")
+                    req_str = f" [{', '.join(reqs)}]"
+                text += f"  {disp} (`{name}`) - {steel}⚙️ + {money:,}💰{fuel_str}{req_str}\n"
             text += "\n"
         return bot.reply_to(message, text, parse_mode="Markdown")
 
@@ -747,6 +855,20 @@ def cmd_craft(message):
                     (unit_name,), fetchone=True)
     if not unit: return bot.reply_to(message, f"Тип '{unit_name}' не найден.")
     disp, steel_c, money_c = unit
+
+    # Проверка требований технологий
+    if unit_name in UNIT_TECH_REQUIREMENTS:
+        missing = []
+        for tech_name, min_lv in UNIT_TECH_REQUIREMENTS[unit_name]:
+            cur_lv = get_tech(uid, tech_name)
+            if cur_lv < min_lv:
+                tech_row = db_query("SELECT display_name FROM tech_types WHERE name=?", (tech_name,), fetchone=True)
+                tech_disp = tech_row[0] if tech_row else tech_name
+                missing.append(f"{tech_disp} Ур.{min_lv} (у вас: {cur_lv})")
+        if missing:
+            return bot.reply_to(message,
+                f"❌ Для производства *{disp}* нужно:\n" + "\n".join(f"- {m}" for m in missing),
+                parse_mode="Markdown")
     total_steel = int(steel_c * qty * max(0.2, 1 - get_tech(uid,'metallurgy')*0.08))
     total_money = int(money_c * qty * max(0.2, 1 - get_tech(uid,'engineering')*0.08))
     bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
@@ -1273,6 +1395,8 @@ def cmd_adminhelp(message):
         "📦 /takeitem @u актив кол-во\n"
         "🛢️ /giveextractor @u кол-во\n"
         "🛢️ /takeextractor @u кол-во\n"
+        "⛏️ /givebuilding @u [gold|steel|coal|aur] кол-во\n"
+        "⛏️ /takebuilding @u [gold|steel|coal|aur] кол-во\n"
         "⚔️ /givemilitary @u тип кол-во\n"
         "📈 /setlevel @u уровень\n"
         "🪖 /settroops @u кол-во\n"
@@ -1385,6 +1509,45 @@ def cmd_takeextractor(message):
     except: return bot.reply_to(message, "Количество - число.")
     db_query("UPDATE user_extractors SET quantity=MAX(0,quantity-?) WHERE user_id=?", (a, t[0]))
     bot.reply_to(message, f"✅ @{t[1]} -{a}🛢️качек")
+
+@bot.message_handler(commands=['givebuilding'])
+@admin_only
+def cmd_givebuilding(message):
+    """Выдать ресурсное здание: /givebuilding @user [gold|steel|coal|aur] кол-во"""
+    args = message.text.split()
+    if len(args) != 4: return bot.reply_to(message, "/givebuilding @user [gold|steel|coal|aur] кол-во")
+    t = find_user(args[1])
+    if not t: return bot.reply_to(message, "Не найден.")
+    res = args[2].lower()
+    if res not in RESOURCE_BUILDINGS:
+        return bot.reply_to(message, f"Ресурс '{res}' не поддерживается. Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
+    try: a = int(args[3])
+    except: return bot.reply_to(message, "Количество - число.")
+    emoji, name, _, _ = RESOURCE_BUILDINGS[res]
+    e = db_query("SELECT quantity FROM user_resource_buildings WHERE user_id=? AND resource=?", (t[0],res), fetchone=True)
+    if e:
+        db_query("UPDATE user_resource_buildings SET quantity=quantity+? WHERE user_id=? AND resource=?", (a,t[0],res))
+    else:
+        db_query("INSERT INTO user_resource_buildings VALUES (?,?,?,?)", (t[0],res,a,0))
+    bot.reply_to(message, f"✅ @{t[1]} +{a}x {emoji}{name}")
+
+@bot.message_handler(commands=['takebuilding'])
+@admin_only
+def cmd_takebuilding(message):
+    """Забрать ресурсное здание: /takebuilding @user [gold|steel|coal|aur] кол-во"""
+    args = message.text.split()
+    if len(args) != 4: return bot.reply_to(message, "/takebuilding @user [gold|steel|coal|aur] кол-во")
+    t = find_user(args[1])
+    if not t: return bot.reply_to(message, "Не найден.")
+    res = args[2].lower()
+    if res not in RESOURCE_BUILDINGS:
+        return bot.reply_to(message, f"Ресурс '{res}' не поддерживается.")
+    try: a = int(args[3])
+    except: return bot.reply_to(message, "Количество - число.")
+    emoji, name, _, _ = RESOURCE_BUILDINGS[res]
+    db_query("UPDATE user_resource_buildings SET quantity=MAX(0,quantity-?) WHERE user_id=? AND resource=?",
+             (a, t[0], res))
+    bot.reply_to(message, f"✅ @{t[1]} -{a}x {emoji}{name}")
 
 @bot.message_handler(commands=['givemilitary'])
 @admin_only
