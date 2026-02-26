@@ -1,19 +1,21 @@
-import telebot
+# -*- coding: utf-8 -*-
+import telebot  # ИСПРАВЛЕНО: было "Import telebot" (с заглавной)
 import sqlite3
 import time
 import random
 import threading
-import math
 import functools
+from telebot import types
 
 TOKEN = '8539716689:AAGMlLbxq7lAlS2t51iZvm_r2UIjCfxJStE'
 ADMIN_IDS = [6115517123, 2046462689, 7787565361]
 ALLOWED_GROUP_IDS = [-1003880025896, -1003790960557]
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
 # ==============================================================
-# КРИТИЧНО: functools.wraps — без него telebot видит все хендлеры
+# ДЕКОРАТОРЫ
+# functools.wraps обязателен - без него telebot видит все хендлеры
 # как одну функцию "wrapper" и регистрирует только первый
 # ==============================================================
 def group_only(func):
@@ -30,13 +32,26 @@ def admin_only(func):
         if message.chat.id not in ALLOWED_GROUP_IDS:
             return
         if not is_admin(message.from_user.id):
-            return bot.reply_to(message, "No access.")
+            return bot.reply_to(message, "Нет доступа.")
         func(message)
     return wrapper
 
 # ==============================================================
-# --- ИНИЦИАЛИЗАЦИЯ БД ---
+# БД
 # ==============================================================
+def db_query(query, args=(), fetchone=False):
+    conn = sqlite3.connect('aurelia_economy.db', check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    c = conn.cursor()
+    c.execute(query, args)
+    if query.strip().upper().startswith("SELECT"):
+        result = c.fetchone() if fetchone else c.fetchall()
+    else:
+        conn.commit()
+        result = None
+    conn.close()
+    return result
+
 def init_db():
     conn = sqlite3.connect('aurelia_economy.db')
     c = conn.cursor()
@@ -70,17 +85,14 @@ def init_db():
         business_name TEXT, quantity INTEGER DEFAULT 1,
         UNIQUE(user_id, business_name)
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS market_assets (
         name TEXT PRIMARY KEY, display_name TEXT,
         price REAL, base_price REAL, last_updated REAL DEFAULT 0, emoji TEXT
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS user_portfolio (
         user_id INTEGER, asset_name TEXT, quantity REAL DEFAULT 0,
         avg_buy_price REAL DEFAULT 0, PRIMARY KEY (user_id, asset_name)
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS military_types (
         name TEXT PRIMARY KEY, display_name TEXT, steel_cost INTEGER,
         money_cost INTEGER, description TEXT,
@@ -99,124 +111,100 @@ def init_db():
         user_id INTEGER, unit_name TEXT, quantity INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, unit_name)
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS user_extractors (
         user_id INTEGER PRIMARY KEY, quantity INTEGER DEFAULT 0, last_extract REAL DEFAULT 0
     )''')
-
-    # Добыча других ресурсов (аналог нефтекачек)
     c.execute('''CREATE TABLE IF NOT EXISTS user_resource_buildings (
-        user_id INTEGER,
-        resource TEXT,
-        quantity INTEGER DEFAULT 0,
-        last_extract REAL DEFAULT 0,
+        user_id INTEGER, resource TEXT,
+        quantity INTEGER DEFAULT 0, last_extract REAL DEFAULT 0,
         PRIMARY KEY (user_id, resource)
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS tech_types (
         name TEXT PRIMARY KEY, display_name TEXT, max_level INTEGER DEFAULT 5,
         ep_cost_per_level INTEGER, description TEXT, effect TEXT
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS user_tech (
         user_id INTEGER, tech_name TEXT, level INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, tech_name)
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS trade_offers (
         id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER, seller_username TEXT,
         offer_type TEXT, offer_name TEXT, offer_qty REAL,
         want_type TEXT, want_name TEXT, want_qty REAL,
         created_at REAL DEFAULT 0, status TEXT DEFAULT 'open'
     )''')
-
     c.execute('''CREATE TABLE IF NOT EXISTS event_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, event_type TEXT, description TEXT,
-        created_at REAL DEFAULT 0
+        user_id INTEGER, event_type TEXT, description TEXT, created_at REAL DEFAULT 0
     )''')
-
     conn.commit()
 
-    # --- Бизнесы (без порта, цены x2) ---
-    # oil_per_unit и coal_per_unit - расход топлива каждые 3 часа на ЕДИНИЦУ техники
     businesses = [
-        ('farm',      '🌾 Ферма',            4000,   40,  'Надежный базовый доход',                0),
-        ('factory',   '🏭 Завод',            10000,  120, 'Производство товаров + ОЭ',             50),
-        ('mine',      '⛏️ Шахта',            16000,  220, 'Добыча ресурсов + ОЭ',                 50),
-        ('casino',    '🎰 Казино',           30000,  450, 'Большой доход, большие вложения',       20),
-        ('bank_biz',  '🏦 Частный банк',     60000,  950, 'Максимальный пассивный доход',          30),
-        ('lab',       '🔬 Лаборатория',      45000,  300, 'Исследования: много ОЭ',               100),
-        ('nps',       '⚛️ АЭС',             500000, 1200, 'Требует Энергетика Ур.3. Снижает расход топлива армии на 25%. Огромный доход.', 80),
+        ('farm',     '🌾 Ферма',          4000,   40,  'Базовый доход',             0),
+        ('factory',  '🏭 Завод',          10000,  120, 'Производство + ОЭ',         50),
+        ('mine',     '⛏️ Шахта',          16000,  220, 'Добыча + ОЭ',               50),
+        ('casino',   '🎰 Казино',         30000,  450, 'Большой доход',             20),
+        ('bank_biz', '🏦 Частный банк',   60000,  950, 'Максимальный доход',        30),
+        ('lab',      '🔬 Лаборатория',    45000,  300, 'Много ОЭ',                 100),
+        ('nps',      '⚛️ АЭС',           500000, 1200, 'Энерг. Ур.3. -25% топлива армии', 80),
     ]
     c.executemany('INSERT OR IGNORE INTO business_types VALUES (?,?,?,?,?,?)', businesses)
     for name, _, _, _, _, ep in businesses:
         c.execute("UPDATE business_types SET ep_per_12h=? WHERE name=?", (ep, name))
 
-    # --- Активы ---
     assets = [
-        ('oil',   '🛢️ Нефть',            100.0, 100.0, '🛢️'),
-        ('gold',  '🥇 Золото',           500.0, 500.0, '🥇'),
-        ('steel', '⚙️ Сталь',             80.0,  80.0, '⚙️'),
-        ('aur',   '💎 Аурит',            300.0, 300.0, '💎'),
-        ('food',  '🌽 Продовольствие',    50.0,  50.0, '🌽'),
-        ('coal',  '🪨 Уголь',             60.0,  60.0, '🪨'),
+        ('oil',   '🛢️ Нефть',           100.0, 100.0, '🛢️'),
+        ('gold',  '🥇 Золото',          500.0, 500.0, '🥇'),
+        ('steel', '⚙️ Сталь',            80.0,  80.0, '⚙️'),
+        ('aur',   '💎 Аурит',           300.0, 300.0, '💎'),
+        ('food',  '🌽 Продовольствие',   50.0,  50.0, '🌽'),
+        ('coal',  '🪨 Уголь',            60.0,  60.0, '🪨'),
     ]
     c.executemany(
         'INSERT OR IGNORE INTO market_assets (name,display_name,price,base_price,emoji) VALUES (?,?,?,?,?)',
         assets)
 
-    # --- Военная техника эпохи 1960-х ---
-    # (name, display, steel, money, desc, power, category, oil_per_unit/3h, coal_per_unit/3h)
-    # oil_per_unit: нефть на 1 единицу за 3 часа
-    # coal_per_unit: уголь на 1 единицу за 3 часа
     military = [
-        # Наземные - не тратят топливо (только деньги на содержание)
-        ('rifle',      '🔫 Винтовки',         2,    200,    'Базовое вооружение пехоты',       1,   'ground', 0,      0),
-        ('machinegun', '🔥 Пулемёты',         5,    500,    'Пулемётная поддержка пехоты',     3,   'ground', 0,      0),
-        ('mortar',     '💣 Миномёты',         15,   2000,   'Полевая огневая поддержка',       8,   'ground', 0,      0),
-        ('apc',        '🚗 БТР',              25,   4000,   'Бронетранспортёр для пехоты',     20,  'ground', 0,      0),
-        ('tank',       '🛡️ Танки',            50,   10000,  'Основная боевая машина',          50,  'ground', 0.002,  0),
-        ('artillery',  '💥 Артиллерия',       80,   16000,  'Дальнобойная огневая поддержка',  40,  'ground', 0,      0),
-        ('aa_gun',     '🎯 ПВО',              60,   14000,  'Зенитные орудия и ракеты',        30,  'ground', 0,      0),
-        ('mlrs',       '🚀 РСЗО',             120,  25000,  'Реактивная система залпового огня', 80, 'ground', 0,      0),
-        ('missile',    '☢️ Баллистические ракеты', 200, 50000, 'Стратегические и тактические ракеты', 150, 'ground', 0, 0),
-        # Авиация - тратят нефть
-        ('plane',      '✈️ Истребители',      120,  30000,  'Реактивные истребители-перехватчики', 80, 'air',   0.003,  0),
-        ('bomber',     '💣 Бомбардировщики',  180,  50000,  'Стратегические бомбардировщики',  100, 'air',    0.005,  0),
-        ('helicopter', '🚁 Вертолёты',        80,   20000,  'Военные вертолёты поддержки',     50,  'air',    0.002,  0),
-        ('bomb',       '💥 Авиабомбы',        20,   3000,   'Боеприпасы для авиации',         5,   'air',    0,      0),
-        # Флот - тратит уголь
-        ('corvette',   '🚤 Корветы',          80,   15000,  'Легкие боевые корабли',          40,  'navy',   0,      0.003),
-        ('ship',       '🚢 Эсминцы',          200,  50000,  'Основа военно-морского флота',   120, 'navy',   0,      0.008),
-        ('submarine',  '🛥️ Подлодки',         150,  40000,  'Скрытые морские удары',          100, 'navy',   0,      0.005),
-        ('cruiser',    '⛵ Крейсеры',         400,  90000,  'Тяжелые боевые корабли',         250, 'navy',   0,      0.015),
-        ('carrier',    '⛴️ Авианосцы',        1000, 300000, 'Господство в океане',            500, 'navy',   0,      0.05),
-        ('nuclear_sub','☢️ Атомные подлодки', 2000, 600000, 'Ядерное сдерживание на море',    1000,'navy',   0,      0.02),
+        ('rifle',       '🔫 Винтовки',              2,    200,   'Базовая пехота',          1,   'ground', 0,     0),
+        ('machinegun',  '🔥 Пулемёты',              5,    500,   'Поддержка пехоты',        3,   'ground', 0,     0),
+        ('mortar',      '💣 Миномёты',              15,   2000,  'Огневая поддержка',       8,   'ground', 0,     0),
+        ('apc',         '🚗 БТР',                   25,   4000,  'Бронетранспортёр',        20,  'ground', 0,     0),
+        ('tank',        '🛡️ Танки',                 50,   10000, 'Основная боевая машина',  50,  'ground', 0.002, 0),
+        ('artillery',   '💥 Артиллерия',            80,   16000, 'Дальнобойная поддержка',  40,  'ground', 0,     0),
+        ('aa_gun',      '🎯 ПВО',                   60,   14000, 'Зенитные орудия',         30,  'ground', 0,     0),
+        ('mlrs',        '🚀 РСЗО',                  120,  25000, 'Залповый огонь',          80,  'ground', 0,     0),
+        ('missile',     '☢️ Баллист. ракеты',       200,  50000, 'Стратегические ракеты',   150, 'ground', 0,     0),
+        ('plane',       '✈️ Истребители',            120,  30000, 'Реактивные перехватчики', 80,  'air',    0.003, 0),
+        ('bomber',      '💣 Бомбардировщики',       180,  50000, 'Стратег. бомбардировщики',100, 'air',    0.005, 0),
+        ('helicopter',  '🚁 Вертолёты',             80,   20000, 'Поддержка с воздуха',     50,  'air',    0.002, 0),
+        ('bomb',        '💥 Авиабомбы',             20,   3000,  'Боеприпасы авиации',      5,   'air',    0,     0),
+        ('corvette',    '🚤 Корветы',               80,   15000, 'Лёгкие боевые корабли',   40,  'navy',   0,     0.003),
+        ('ship',        '🚢 Эсминцы',               200,  50000, 'Основа флота',            120, 'navy',   0,     0.008),
+        ('submarine',   '🛥️ Подлодки',              150,  40000, 'Скрытые удары',           100, 'navy',   0,     0.005),
+        ('cruiser',     '⛵ Крейсеры',              400,  90000, 'Тяжёлые корабли',         250, 'navy',   0,     0.015),
+        ('carrier',     '⛴️ Авианосцы',             1000, 300000,'Господство в океане',     500, 'navy',   0,     0.05),
+        ('nuclear_sub', '☢️ Атомные подлодки',      2000, 600000,'Ядерное сдерживание',    1000, 'navy',   0,     0.02),
     ]
     c.executemany('INSERT OR IGNORE INTO military_types VALUES (?,?,?,?,?,?,?,?,?)', military)
     for row in military:
         c.execute("UPDATE military_types SET power_value=?,category=?,oil_per_unit=?,coal_per_unit=? WHERE name=?",
                   (row[5], row[6], row[7], row[8], row[0]))
 
-    # --- Технологии ---
     techs = [
-        ('finance',    '💹 Финансы',          5, 300,  '+10% к доходу /cash за уровень',          '+10%cash'),
-        ('logistics',  '🚛 Логистика',        5, 450,  '-10% к содержанию армии за уровень',      '-10%maint'),
-        ('metallurgy', '🔩 Металлургия',       5, 600,  '-8% к расходу Стали при крафте',          '-8%steel'),
-        ('engineering','⚙️ Инженерия',        5, 600,  '-8% к денежному расходу при крафте',      '-8%money'),
-        ('military_sc','🎖️ Военная наука',    5, 750,  '+15% к боевой мощи за уровень',           '+15%power'),
-        ('industry',   '🏗️ Индустриализация', 5, 540,  '+20% к генерации ОЭ за уровень',          '+20%EP'),
-        ('energy',     '⚡ Энергетика',       5, 660,  '-10% к расходу топлива за уровень',       '-10%fuel'),
-        ('trading',    '🤝 Торговля',         3, 450,  '-1% комиссия на бирже за уровень',         '-1%fee'),
-        ('espionage',  '🕵️ Разведка',         3, 900,  'Расширенные возможности разведки',        'spy'),
-        ('naval',      '⚓ Морское дело',      5, 750,  '+20% к мощи флота за уровень',            '+20%navy'),
-        ('morale_tech','🎺 Политработа',      5, 540,  '+5% морали за уровень, -5% дезертирства', '+morale'),
-        ('nuclear',    '☢️ Ядерная программа',5, 1200, 'Открывает производство ядерного оружия',  'nuclear'),
+        ('finance',    '💹 Финансы',          5, 300,  '+10% к доходу /cash за уровень',        '+10%cash'),
+        ('logistics',  '🚛 Логистика',        5, 450,  '-10% содержание армии за уровень',      '-10%maint'),
+        ('metallurgy', '🔩 Металлургия',      5, 600,  '-8% расход стали при крафте',           '-8%steel'),
+        ('engineering','⚙️ Инженерия',        5, 600,  '-8% денежный расход при крафте',        '-8%money'),
+        ('military_sc','🎖️ Военная наука',    5, 750,  '+15% боевой мощи за уровень',           '+15%power'),
+        ('industry',   '🏗️ Индустриализация', 5, 540,  '+20% генерация ОЭ за уровень',          '+20%EP'),
+        ('energy',     '⚡ Энергетика',       5, 660,  '-10% расход топлива за уровень',        '-10%fuel'),
+        ('trading',    '🤝 Торговля',         3, 450,  '-1% комиссии на бирже за уровень',      '-1%fee'),
+        ('espionage',  '🕵️ Разведка',         3, 900,  'Расширенные возможности разведки',      'spy'),
+        ('naval',      '⚓ Морское дело',      5, 750,  '+20% мощь флота за уровень',            '+20%navy'),
+        ('morale_tech','🎺 Политработа',      5, 540,  '+5% морали, -5% дезертирства за уровень','+morale'),
+        ('nuclear',    '☢️ Ядерная программа',5, 1200, 'Открывает ядерное оружие',              'nuclear'),
     ]
     c.executemany('INSERT OR IGNORE INTO tech_types VALUES (?,?,?,?,?,?)', techs)
-
-    # Обновить цены технологий если они изменились
     for row in techs:
         c.execute("UPDATE tech_types SET ep_cost_per_level=? WHERE name=?", (row[3], row[0]))
 
@@ -225,8 +213,9 @@ def init_db():
 
 init_db()
 
-# Требования технологий для производства юнитов
-# формат: unit_name -> [(tech_name, min_level), ...]
+# ==============================================================
+# КОНСТАНТЫ
+# ==============================================================
 UNIT_TECH_REQUIREMENTS = {
     'artillery':  [('military_sc', 1)],
     'aa_gun':     [('military_sc', 1)],
@@ -239,65 +228,48 @@ UNIT_TECH_REQUIREMENTS = {
     'nuclear_sub':[('naval', 5), ('military_sc', 3), ('nuclear', 5)],
 }
 
-# Доп. ресурсные требования для ядерного оружия (на 1 единицу)
 UNIT_RESOURCE_REQUIREMENTS = {
     'missile':    {'aur': 10, 'oil': 5},
     'nuclear_sub':{'aur': 80},
 }
 
-# Конфигурация ресурсных зданий
-# resource -> (emoji, display_name, yield_per_building, cooldown_seconds)
 RESOURCE_BUILDINGS = {
-    'gold':  ('🥇', 'Золотой рудник',       1, 14400),  # 4ч
-    'steel': ('⚙️', 'Сталелитейный завод',  2, 10800),  # 3ч
-    'coal':  ('🪨', 'Угольная шахта',        3, 7200),   # 2ч
-    'aur':   ('💎', 'Аурит-шахта',           1, 21600),  # 6ч
+    'gold':  ('🥇', 'Золотой рудник',      1, 14400),
+    'steel': ('⚙️', 'Сталелитейный завод', 2, 10800),
+    'coal':  ('🪨', 'Угольная шахта',       3, 7200),
+    'aur':   ('💎', 'Аурит-шахта',          1, 21600),
 }
 
 # ==============================================================
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================================================
-def db_query(query, args=(), fetchone=False):
-    conn = sqlite3.connect('aurelia_economy.db', check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    c = conn.cursor()
-    c.execute(query, args)
-    if query.strip().upper().startswith("SELECT"):
-        result = c.fetchone() if fetchone else c.fetchall()
-    else:
-        conn.commit()
-        result = None
-    conn.close()
-    return result
-
 def is_admin(uid): return uid in ADMIN_IDS
 def is_banned(uid):
     r = db_query("SELECT banned FROM users WHERE user_id=?", (uid,), fetchone=True)
     return r and r[0] == 1
 
 def get_tech(uid, name):
-    r = db_query("SELECT level FROM user_tech WHERE user_id=? AND tech_name=?", (uid,name), fetchone=True)
+    r = db_query("SELECT level FROM user_tech WHERE user_id=? AND tech_name=?", (uid, name), fetchone=True)
     return r[0] if r else 0
 
 def get_price_arrow(price, base):
     if price > base * 1.1: return "📈"
-    elif price < base * 0.9: return "📉"
+    if price < base * 0.9: return "📉"
     return "➡️"
 
 def calc_power(uid):
-    units = db_query('''SELECT um.unit_name, um.quantity, mt.power_value, mt.category
+    units = db_query('''SELECT um.quantity, mt.power_value, mt.category
                         FROM user_military um JOIN military_types mt ON um.unit_name=mt.name
                         WHERE um.user_id=? AND um.quantity>0''', (uid,))
     troops = (db_query("SELECT troops FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-    morale = (db_query("SELECT morale FROM users WHERE user_id=?", (uid,), fetchone=True) or [100])[0]
-    morale_mult = max(0.1, morale / 100)
-    power = troops
+    morale = (db_query("SELECT morale FROM users WHERE user_id=?", (uid,), fetchone=True) or [100])[0] or 100
     naval_bonus = 1 + get_tech(uid, 'naval') * 0.20
-    for _, qty, pv, cat in (units or []):
+    power = troops
+    for qty, pv, cat in (units or []):
         b = naval_bonus if cat == 'navy' else 1.0
         power += int(qty * pv * b)
     mil_bonus = 1 + get_tech(uid, 'military_sc') * 0.15
-    return int(power * mil_bonus * morale_mult)
+    return int(power * mil_bonus * max(0.1, morale / 100))
 
 def ensure_user(message):
     uid = message.from_user.id
@@ -317,39 +289,253 @@ def log_event(uid, event_type, description):
              (uid, event_type, description, time.time()))
 
 def add_asset(uid, asset_name, amount):
-    e = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                 (uid, asset_name), fetchone=True)
+    e = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset_name), fetchone=True)
     if e:
-        db_query("UPDATE user_portfolio SET quantity=quantity+? WHERE user_id=? AND asset_name=?",
-                 (amount, uid, asset_name))
+        db_query("UPDATE user_portfolio SET quantity=quantity+? WHERE user_id=? AND asset_name=?", (amount, uid, asset_name))
     else:
         db_query("INSERT INTO user_portfolio VALUES (?,?,?,?)", (uid, asset_name, amount, 0))
 
-GROUND = {'rifle','machinegun','mortar','apc','tank','artillery','aa_gun','mlrs','missile'}
-AIR    = {'plane','bomber','helicopter','bomb'}
-NAVY   = {'corvette','ship','submarine','cruiser','carrier','nuclear_sub'}
+def md(text):
+    """Отправить с Markdown разметкой"""
+    return text
 
 # ==============================================================
-# --- ФОНОВЫЕ ПОТОКИ ---
+# INLINE КЛАВИАТУРЫ - ФАБРИКИ
+# ==============================================================
+def kb_main():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("👤 Профиль",     callback_data="m:profile"),
+        types.InlineKeyboardButton("💵 Налоги",      callback_data="m:cash"),
+        types.InlineKeyboardButton("🏢 Бизнесы",     callback_data="m:biz"),
+        types.InlineKeyboardButton("📊 Биржа",        callback_data="m:market"),
+        types.InlineKeyboardButton("⚔️ Армия",        callback_data="m:army"),
+        types.InlineKeyboardButton("🔬 Технологии",  callback_data="m:tech"),
+        types.InlineKeyboardButton("⛏️ Добыча",       callback_data="m:extract"),
+        types.InlineKeyboardButton("🤝 Торговля",    callback_data="m:trade"),
+        types.InlineKeyboardButton("🏆 Рейтинги",    callback_data="m:top"),
+        types.InlineKeyboardButton("🌍 Мир",          callback_data="m:world"),
+    )
+    return kb
+
+def kb_back(target="m:main"):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data=target))
+    return kb
+
+def kb_back_row(target="m:main"):
+    return [types.InlineKeyboardButton("◀️ Назад", callback_data=target)]
+
+# ==============================================================
+# ТЕКСТОВЫЕ СБОРЩИКИ (для inline-меню)
+# ==============================================================
+def build_profile_text(uid):
+    user = db_query("SELECT balance,level,troops,ep,morale FROM users WHERE user_id=?", (uid,), fetchone=True)
+    if not user: return "Введите /start"
+    bal, lv, troops, ep, morale = user
+    morale = morale or 100
+    iph = (db_query('''SELECT SUM(ub.quantity*bt.income_per_hour) FROM user_businesses ub
+                        JOIN business_types bt ON ub.business_name=bt.name WHERE ub.user_id=?''',
+                    (uid,), fetchone=True) or [0])[0] or 0
+    ext = (db_query("SELECT quantity FROM user_extractors WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
+    power = calc_power(uid)
+
+    if   bal >= 2_000_000: tax_str = "3.5%/ч 🔴"
+    elif bal >= 1_000_000: tax_str = "3.0%/ч 🔴"
+    elif bal >= 500_000:   tax_str = "2.5%/ч 🟠"
+    elif bal >= 200_000:   tax_str = "2.0%/ч 🟠"
+    elif bal >= 100_000:   tax_str = "1.0%/ч 🟡"
+    elif bal >= 50_000:    tax_str = "0.5%/ч 🟡"
+    else:                  tax_str = "нет ✅"
+
+    if   morale >= 80: morale_str = f"{morale}% 💚"
+    elif morale >= 50: morale_str = f"{morale}% 🟡"
+    elif morale >= 25: morale_str = f"{morale}% 🟠"
+    else:              morale_str = f"{morale}% 🔴 КРИЗИС"
+
+    uname = (db_query("SELECT username FROM users WHERE user_id=?", (uid,), fetchone=True) or ['?'])[0]
+    return (
+        f"👤 *@{uname}*\n\n"
+        f"💰 Баланс: {bal:,}\n"
+        f"💸 Налог на богатство: {tax_str}\n"
+        f"📈 Уровень экономики: {lv}\n"
+        f"🪖 Пехота: {troops:,}\n"
+        f"🎺 Мораль: {morale_str}\n"
+        f"⚔️ Военная мощь: {power:,}\n"
+        f"🏭 Доход: ~{iph} 💰/ч\n"
+        f"🔬 ОЭ: {ep}\n"
+        f"🛢️ Нефтекачек: {ext}"
+    )
+
+def build_market_text():
+    assets = db_query("SELECT name,display_name,price,base_price FROM market_assets")
+    text = "📊 *Мировая биржа:*\n\n"
+    for name, disp, price, base in assets:
+        arr = get_price_arrow(price, base)
+        pct = ((price - base) / base) * 100
+        sign = "+" if pct >= 0 else ""
+        text += f"{arr} *{disp}*: {price:.2f}💰 ({sign}{pct:.1f}%)\n"
+    text += "\n_Покупка:_ `/buy [актив] [кол-во]`\n_Продажа:_ `/sell [актив] [кол-во]`"
+    return text
+
+def build_army_text(uid):
+    user = db_query("SELECT troops, morale FROM users WHERE user_id=?", (uid,), fetchone=True)
+    if not user: return "Введите /start"
+    troops, morale = user
+    morale = morale or 100
+    units = db_query('''SELECT u.unit_name, m.display_name, u.quantity, m.category,
+                               m.oil_per_unit, m.coal_per_unit
+                        FROM user_military u JOIN military_types m ON u.unit_name=m.name
+                        WHERE u.user_id=? AND u.quantity>0''', (uid,))
+    secs = {'ground': [], 'air': [], 'navy': []}
+    total_oil = total_coal = 0.0
+    energy_mult = max(0.1, 1 - get_tech(uid, 'energy') * 0.10)
+    has_aes = db_query("SELECT quantity FROM user_businesses WHERE user_id=? AND business_name='nps'", (uid,), fetchone=True)
+    nps_b = 0.25 if (has_aes and has_aes[0] > 0) else 0.0
+    fuel_mult = max(0.05, energy_mult - nps_b)
+
+    for uname, disp, qty, cat, oil_pu, coal_pu in (units or []):
+        secs.get(cat, secs['ground']).append(f"  {disp}: {qty:,}")
+        total_oil  += oil_pu  * qty * fuel_mult
+        total_coal += coal_pu * qty * fuel_mult
+
+    logi = get_tech(uid, 'logistics')
+    maint = int((troops / 5) * max(0.1, 1 - logi * 0.10))
+    power = calc_power(uid)
+
+    text = f"⚔️ *Вооружённые силы:*\n\n"
+    text += f"🪖 *Наземные:*\n  Пехота: {troops:,}\n"
+    text += ("\n".join(secs['ground']) + "\n") if secs['ground'] else "  Нет техники\n"
+    text += f"\n✈️ *Авиация:*\n"
+    text += ("\n".join(secs['air']) + "\n") if secs['air'] else "  Нет авиации\n"
+    text += f"\n🚢 *Флот:*\n"
+    text += ("\n".join(secs['navy']) + "\n") if secs['navy'] else "  Нет флота\n"
+    text += f"\n⚔️ *Мощь: {power:,}* (мораль: {morale}%)\n"
+    text += f"💸 Содержание пехоты: ~{maint} 💰/ч\n"
+    if total_oil > 0:
+        text += f"🛢️ Расход нефти: {total_oil:.2f}/3ч"
+        if nps_b > 0: text += " (⚛️ -25%)"
+        text += "\n"
+    if total_coal > 0:
+        text += f"🪨 Расход угля: {total_coal:.2f}/3ч"
+        if nps_b > 0: text += " (⚛️ -25%)"
+        text += "\n"
+    return text
+
+def build_craft_text(uid, category):
+    cat_names = {'ground': '🪖 Наземные', 'air': '✈️ Авиация', 'navy': '🚢 Флот'}
+    units = db_query(
+        "SELECT name,display_name,steel_cost,money_cost,oil_per_unit,coal_per_unit FROM military_types WHERE category=?",
+        (category,))
+    text = f"⚙️ *Производство - {cat_names.get(category, category)}:*\n\n"
+    for name, disp, steel, money, oil_pu, coal_pu in (units or []):
+        fuel_str = ""
+        if oil_pu > 0:  fuel_str = f" | 🛢️{oil_pu}/3ч"
+        if coal_pu > 0: fuel_str = f" | 🪨{coal_pu}/3ч"
+        req_parts = []
+        for tname, tlv in UNIT_TECH_REQUIREMENTS.get(name, []):
+            cur = get_tech(uid, tname)
+            req_parts.append("✅" if cur >= tlv else f"❌{tname}Ур.{tlv}")
+        req_str = f" [{', '.join(req_parts)}]" if req_parts else ""
+        text += f"*{disp}* (`{name}`)\n  {steel}⚙️ + {money:,}💰{fuel_str}{req_str}\n"
+    text += f"\n_Команда:_ `/craft [тип] [кол-во]`\n_Пример:_ `/craft tank 5`"
+    return text
+
+def build_tech_text(uid):
+    techs = db_query("SELECT name,display_name,max_level,ep_cost_per_level,description FROM tech_types")
+    ep = (db_query("SELECT ep FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
+    text = f"🔬 *Технологии*  |  💡 ОЭ: {ep}\n\n"
+    for name, disp, maxlv, cost, desc in (techs or []):
+        lv = get_tech(uid, name)
+        if lv >= maxlv:
+            status = "✅ МАКС"
+        else:
+            status = f"Ур.{lv}/{maxlv} - {cost} ОЭ"
+        text += f"*{disp}* `{name}`\n_{desc}_\n{status}\n\n"
+    text += "_Команда:_ `/researchtech [название]`"
+    return text
+
+def build_extract_text(uid):
+    ext = db_query("SELECT quantity,last_extract FROM user_extractors WHERE user_id=?", (uid,), fetchone=True)
+    text = "⛏️ *Добыча ресурсов:*\n\n"
+    now = time.time()
+
+    # Нефть
+    oil_qty = ext[0] if ext else 0
+    if oil_qty > 0:
+        last = ext[1] if ext else 0
+        if now - (last or 0) < 3600:
+            left = int(3600 - (now - last))
+            cd = f"через {left//60}м {left%60}с"
+        else:
+            cd = "✅ Готово!"
+        text += f"🛢️ *Нефтекачек*: {oil_qty} шт. - {cd}\n  `/extractoil`\n\n"
+    else:
+        text += f"🛢️ *Нефть*: нет качек\n\n"
+
+    # Ресурсные здания
+    for res, (emoji, name, yld, cd_sec) in RESOURCE_BUILDINGS.items():
+        row = db_query("SELECT quantity,last_extract FROM user_resource_buildings WHERE user_id=? AND resource=?", (uid, res), fetchone=True)
+        qty = row[0] if row else 0
+        last = row[1] if row else 0
+        if qty > 0:
+            if now - (last or 0) < cd_sec:
+                left = int(cd_sec - (now - last))
+                cd_str = f"через {left//3600}ч {(left%3600)//60}м" if left >= 3600 else f"через {left//60}м"
+            else:
+                cd_str = f"✅ +{qty*yld}{emoji}"
+            text += f"{emoji} *{name}*: {qty} шт. - {cd_str}\n  `/extract {res}`\n\n"
+        else:
+            text += f"{emoji} *{name}*: нет зданий\n\n"
+    return text
+
+def build_trades_text():
+    offers = db_query('''SELECT id,seller_username,offer_type,offer_name,offer_qty,
+                                want_type,want_name,want_qty FROM trade_offers
+                         WHERE status='open' ORDER BY id DESC LIMIT 15''')
+    if not offers: return "📭 Открытых предложений нет.\n\n_Создать: `/trade тип что кол-во тип что кол-во`_"
+    text = "🤝 *Торговые предложения:*\n\n"
+    for tid, seller, ot, on, oq, wt, wn, wq in offers:
+        ostr = f"{int(oq):,}💰" if ot == 'money' else f"{oq} {on}"
+        wstr = f"{int(wq):,}💰" if wt == 'money' else f"{wq} {wn}"
+        text += f"*#{tid}* @{seller}: {ostr} → {wstr}  `/accept {tid}`\n"
+    text += "\n_Отменить: `/canceltrade ID`_"
+    return text
+
+def build_top_text():
+    text = "🏆 *Рейтинги:*\n\n"
+    rows = db_query("SELECT username,balance FROM users WHERE banned=0 ORDER BY balance DESC LIMIT 5")
+    text += "*💰 Топ по балансу:*\n"
+    medals = ["🥇","🥈","🥉","4.","5."]
+    for i,(u,v) in enumerate(rows or []):
+        text += f"{medals[i]} @{u} - {v:,}💰\n"
+    text += "\n"
+    rows = db_query("SELECT username,ep FROM users WHERE banned=0 ORDER BY ep DESC LIMIT 5")
+    text += "*🔬 Топ по ОЭ:*\n"
+    for i,(u,v) in enumerate(rows or []):
+        text += f"{medals[i]} @{u} - {v:,}ОЭ\n"
+    text += "\n⚔️ Военный рейтинг: /toparmy"
+    return text
+
+# ==============================================================
+# ФОНОВЫЕ ПОТОКИ
 # ==============================================================
 def market_updater():
     while True:
         time.sleep(3600)
         for name, price, base in db_query("SELECT name,price,base_price FROM market_assets"):
             change = random.uniform(-0.20, 0.20)
-            new_p = max(base*0.4, min(base*2.5, price*(1+change)))
-            db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?",
-                     (round(new_p,2), time.time(), name))
+            new_p = max(base * 0.4, min(base * 2.5, price * (1 + change)))
+            db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (round(new_p, 2), time.time(), name))
 
 def passive_income():
     while True:
         time.sleep(600)
         rows = db_query('''SELECT ub.user_id, SUM(ub.quantity*bt.income_per_hour)
-                           FROM user_businesses ub
-                           JOIN business_types bt ON ub.business_name=bt.name
+                           FROM user_businesses ub JOIN business_types bt ON ub.business_name=bt.name
                            GROUP BY ub.user_id''')
         for uid, total in (rows or []):
-            income = int(total * (600/3600))
+            income = int(total * (600 / 3600))
             if income > 0:
                 db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (income, uid))
 
@@ -365,39 +551,21 @@ def ep_gen():
         for uid, last_ep in (db_query("SELECT user_id,last_ep FROM users") or []):
             if uid in ep_map and (now - (last_ep or 0)) >= EP_INT:
                 bonus = 1 + get_tech(uid, 'industry') * 0.20
-                base_gain = ep_map[uid] * bonus
-                # Случайное отклонение ±10%
-                gain = int(base_gain * random.uniform(0.90, 1.10))
+                gain = int(ep_map[uid] * bonus * random.uniform(0.90, 1.10))
                 if gain > 0:
                     db_query("UPDATE users SET ep=ep+?, last_ep=? WHERE user_id=?", (gain, now, uid))
 
 def army_upkeep():
-    """
-    Каждый час:
-    - Содержание пехоты: каждые 5 солдат = 1 /ч
-    - Прогрессивный налог на богатство (с 50к)
-    - Дезертирство при нехватке денег на содержание
-    - Падение морали при дезертирстве
-    Каждые 3 часа:
-    - Расход нефти: танки + авиация
-    - Расход угля: флот
-    """
-    fuel_acc = {}   # накопитель для дробного расхода топлива
+    fuel_acc = {}
     tick = 0
     while True:
         time.sleep(3600)
         tick += 1
-
         users = db_query("SELECT user_id,troops,balance,morale FROM users WHERE banned=0")
         for uid, troops, bal, morale in (users or []):
             morale = morale or 100
-
-            # Содержание пехоты
             logi = get_tech(uid, 'logistics')
-            reduction = max(0.1, 1 - logi * 0.10)
-            maint = int((troops / 5) * reduction)
-
-            # Прогрессивный налог (начинается с 50к)
+            maint = int((troops / 5) * max(0.1, 1 - logi * 0.10))
             if   bal >= 2_000_000: tax = int(bal * 0.035)
             elif bal >= 1_000_000: tax = int(bal * 0.030)
             elif bal >= 500_000:   tax = int(bal * 0.025)
@@ -406,270 +574,527 @@ def army_upkeep():
             elif bal >= 100_000:   tax = int(bal * 0.010)
             elif bal >= 50_000:    tax = int(bal * 0.005)
             else:                  tax = 0
-
             total_deduct = maint + tax
-
-            if total_deduct == 0:
-                continue
+            if total_deduct == 0: continue
 
             if bal >= total_deduct:
                 db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (total_deduct, uid))
             else:
-                # Не хватает денег - дезертирство
                 unpaid_maint = max(0, maint - bal)
                 db_query("UPDATE users SET balance=0 WHERE user_id=?", (uid,))
-
                 if troops > 0 and unpaid_maint > 0:
                     morale_tech = get_tech(uid, 'morale_tech')
-                    # Базовое дезертирство 3%/ч, снижается технологией
                     base_rate = max(0.005, 0.03 - morale_tech * 0.005)
-                    # Чем ниже мораль, тем больше дезертирство
                     morale_factor = max(1.0, (100 - morale) / 50 + 1)
                     rate = min(0.15, base_rate * morale_factor)
-                    lost = max(10, int(troops * rate))
-                    lost = min(lost, troops)
-
+                    lost = min(max(10, int(troops * rate)), troops)
                     db_query("UPDATE users SET troops=MAX(0,troops-?) WHERE user_id=?", (lost, uid))
-                    # Мораль падает
-                    morale_drop = random.randint(3, 8)
-                    new_morale = max(10, morale - morale_drop)
+                    new_morale = max(10, morale - random.randint(3, 8))
                     db_query("UPDATE users SET morale=? WHERE user_id=?", (new_morale, uid))
-                    log_event(uid, 'desertion',
-                              f"Дезертировало {lost} солдат (нет денег на содержание). Мораль: {new_morale}")
+                    log_event(uid, 'desertion', f"Дезертировало {lost} солдат. Мораль: {new_morale}")
 
-            # Восстановление морали при достатке
             if bal >= total_deduct * 2 and morale < 100:
-                recovery = random.randint(1, 3) + get_tech(uid, 'morale_tech')
-                new_morale = min(100, morale + recovery)
+                new_morale = min(100, morale + random.randint(1, 3) + get_tech(uid, 'morale_tech'))
                 db_query("UPDATE users SET morale=? WHERE user_id=?", (new_morale, uid))
 
-        # --- Расход топлива каждые 3 часа ---
         if tick % 3 == 0:
             energy_units = db_query('''SELECT user_id, unit_name, quantity, oil_per_unit, coal_per_unit
-                                       FROM user_military um
-                                       JOIN military_types mt ON um.unit_name=mt.name
-                                       WHERE (mt.oil_per_unit > 0 OR mt.coal_per_unit > 0) AND um.quantity > 0''')
-
-            # Группируем расход по пользователям
+                                       FROM user_military um JOIN military_types mt ON um.unit_name=mt.name
+                                       WHERE (mt.oil_per_unit>0 OR mt.coal_per_unit>0) AND um.quantity>0''')
             fuel_needs = {}
             for uid, unit_name, qty, oil_pu, coal_pu in (energy_units or []):
-                if uid not in fuel_needs:
-                    fuel_needs[uid] = {'oil': 0.0, 'coal': 0.0}
+                if uid not in fuel_needs: fuel_needs[uid] = {'oil': 0.0, 'coal': 0.0}
                 energy_tech = get_tech(uid, 'energy')
-                has_aes = db_query("SELECT quantity FROM user_businesses WHERE user_id=? AND business_name='nps'",
-                                   (uid,), fetchone=True)
-                nps_bonus = 0.25 if (has_aes and has_aes[0] > 0) else 0.0
-                fuel_mult = max(0.05, 1 - energy_tech * 0.10 - nps_bonus)
-                fuel_needs[uid]['oil']  += oil_pu  * qty * fuel_mult
-                fuel_needs[uid]['coal'] += coal_pu * qty * fuel_mult
+                has_aes = db_query("SELECT quantity FROM user_businesses WHERE user_id=? AND business_name='nps'", (uid,), fetchone=True)
+                nps_b = 0.25 if (has_aes and has_aes[0] > 0) else 0.0
+                fm = max(0.05, 1 - energy_tech * 0.10 - nps_b)
+                fuel_needs[uid]['oil']  += oil_pu  * qty * fm
+                fuel_needs[uid]['coal'] += coal_pu * qty * fm
 
             for uid, needs in fuel_needs.items():
-                if uid not in fuel_acc:
-                    fuel_acc[uid] = {'oil': 0.0, 'coal': 0.0}
-
+                if uid not in fuel_acc: fuel_acc[uid] = {'oil': 0.0, 'coal': 0.0}
                 for res in ('oil', 'coal'):
                     fuel_acc[uid][res] += needs[res]
                     to_ded = int(fuel_acc[uid][res])
                     if to_ded > 0:
                         fuel_acc[uid][res] -= to_ded
-                        row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                                       (uid, res), fetchone=True)
-                        current = row[0] if row else 0
-                        actual = min(to_ded, int(current))
+                        row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, res), fetchone=True)
+                        actual = min(to_ded, int(row[0]) if row else 0)
                         if actual > 0:
-                            db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?",
-                                     (actual, uid, res))
-                        # Если нефти/угля нет и есть авиация/флот, падает мораль
+                            db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?", (actual, uid, res))
                         if actual < to_ded:
-                            morale_row = db_query("SELECT morale FROM users WHERE user_id=?", (uid,), fetchone=True)
-                            if morale_row:
-                                new_morale = max(20, (morale_row[0] or 100) - random.randint(1, 3))
-                                db_query("UPDATE users SET morale=? WHERE user_id=?", (new_morale, uid))
+                            mr = db_query("SELECT morale FROM users WHERE user_id=?", (uid,), fetchone=True)
+                            if mr:
+                                db_query("UPDATE users SET morale=? WHERE user_id=?",
+                                         (max(20, (mr[0] or 100) - random.randint(1, 3)), uid))
 
 def food_consumption():
-    """
-    Каждые 6 часов войска потребляют продовольствие.
-    Нехватка еды - падение морали и небольшое дезертирство.
-    """
     while True:
         time.sleep(21600)
-        users = db_query("SELECT user_id, troops, morale FROM users WHERE troops > 0 AND banned=0")
-        for uid, troops, morale in (users or []):
+        for uid, troops, morale in (db_query("SELECT user_id,troops,morale FROM users WHERE troops>0 AND banned=0") or []):
             morale = morale or 100
-            # 1 еда на 1000 солдат каждые 6 часов
             food_needed = max(1, troops // 1000)
-            food_row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='food'",
-                                (uid,), fetchone=True)
-            food_have = int(food_row[0]) if food_row else 0
-
+            fr = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='food'", (uid,), fetchone=True)
+            food_have = int(fr[0]) if fr else 0
             if food_have >= food_needed:
-                db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name='food'",
-                         (food_needed, uid))
-                # Мораль немного растет при наличии еды
+                db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name='food'", (food_needed, uid))
                 if morale < 100:
                     db_query("UPDATE users SET morale=MIN(100,morale+1) WHERE user_id=?", (uid,))
             else:
-                # Нет еды - мораль падает, небольшое дезертирство
                 if food_have > 0:
                     db_query("DELETE FROM user_portfolio WHERE user_id=? AND asset_name='food'", (uid,))
-                morale_drop = random.randint(2, 5)
-                new_morale = max(5, morale - morale_drop)
+                new_morale = max(5, morale - random.randint(2, 5))
                 db_query("UPDATE users SET morale=? WHERE user_id=?", (new_morale, uid))
-
                 if troops > 0:
-                    hunger_desertion = max(5, int(troops * 0.01))
-                    db_query("UPDATE users SET troops=MAX(0,troops-?) WHERE user_id=?", (hunger_desertion, uid))
-                    log_event(uid, 'hunger', f"Нехватка продовольствия! -{hunger_desertion} солдат, мораль: {new_morale}")
+                    lost = max(5, int(troops * 0.01))
+                    db_query("UPDATE users SET troops=MAX(0,troops-?) WHERE user_id=?", (lost, uid))
+                    log_event(uid, 'hunger', f"Голод! -{lost} солдат, мораль: {new_morale}")
 
 for fn in [market_updater, passive_income, ep_gen, army_upkeep, food_consumption]:
     threading.Thread(target=fn, daemon=True).start()
 
 # ==============================================================
-# --- ОСНОВНЫЕ КОМАНДЫ ---
+# УСТАНОВИТЬ ПОДСКАЗКИ КОМАНД В TELEGRAM
 # ==============================================================
+def set_commands():
+    bot.set_my_commands([
+        types.BotCommand("/menu",         "🎮 Главное меню"),
+        types.BotCommand("/profile",      "👤 Ваш профиль"),
+        types.BotCommand("/cash",         "💵 Собрать налоги"),
+        types.BotCommand("/pay",          "💸 Перевести деньги"),
+        types.BotCommand("/army",         "⚔️ Состав армии"),
+        types.BotCommand("/craft",        "⚙️ Производство техники"),
+        types.BotCommand("/draft",        "🪖 Призвать армию"),
+        types.BotCommand("/market",       "📊 Биржа ресурсов"),
+        types.BotCommand("/portfolio",    "💼 Портфель активов"),
+        types.BotCommand("/tech",         "🔬 Технологии"),
+        types.BotCommand("/trades",       "🤝 Торговые предложения"),
+        types.BotCommand("/top",          "🏆 Рейтинги"),
+        types.BotCommand("/events",       "📋 Журнал событий"),
+        types.BotCommand("/help",         "📖 Все команды"),
+    ])
 
-@bot.message_handler(commands=['start'])
+# ==============================================================
+# ГЛАВНАЯ КОМАНДА: /menu
+# ==============================================================
+@bot.message_handler(commands=['menu', 'start'])
 @group_only
-def cmd_start(message):
+def cmd_menu(message):
     uid, uname = ensure_user(message)
     if is_banned(uid): return bot.reply_to(message, "Вы заблокированы.")
-    bot.reply_to(message,
-        "🌍 *Добро пожаловать в Аурелию!*\n\n"
-        "💰 Стартовый капитал: 1000\n\n"
-        "Введите /help для полного списка команд.\n\n"
-        "📋 *Быстрый старт:*\n"
-        "/profile - ваш профиль\n"
-        "/cash - собрать налоги\n"
-        "/shop - купить бизнес\n"
-        "/draft - призвать армию\n"
-        "/market - биржа ресурсов",
-        parse_mode="Markdown")
+    text = (
+        "🌍 *Аурелия - экономическая стратегия*\n\n"
+        "Выберите раздел:"
+    )
+    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb_main())
 
+# ==============================================================
+# CALLBACK HANDLER - весь inline-интерфейс
+# ==============================================================
+@bot.callback_query_handler(func=lambda c: True)
+def callback_handler(call):
+    if call.message.chat.id not in ALLOWED_GROUP_IDS:
+        return bot.answer_callback_query(call.id)
+
+    uid = call.from_user.id
+    if is_banned(uid):
+        return bot.answer_callback_query(call.id, "Вы заблокированы.")
+
+    # Убеждаемся что пользователь есть в БД
+    uname = call.from_user.username or f"player_{uid}"
+    if not db_query("SELECT user_id FROM users WHERE user_id=?", (uid,), fetchone=True):
+        db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)", (uid, uname))
+
+    data = call.data
+
+    def edit(text, kb=None):
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+
+    # ─── Главное меню ───────────────────────────────────────────
+    if data == "m:main":
+        edit("🌍 *Аурелия - экономическая стратегия*\n\nВыберите раздел:", kb_main())
+
+    # ─── Профиль ────────────────────────────────────────────────
+    elif data == "m:profile":
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("💵 Собрать налоги", callback_data="m:cash"),
+            types.InlineKeyboardButton("📈 Улучшить экономику", callback_data="m:upgrade"),
+            types.InlineKeyboardButton("📋 Журнал событий", callback_data="m:events"),
+            types.InlineKeyboardButton("🎺 Мораль армии", callback_data="m:morale"),
+        )
+        kb.row(types.InlineKeyboardButton("◀️ Назад", callback_data="m:main"))
+        edit(build_profile_text(uid), kb)
+
+    # ─── Налоги ─────────────────────────────────────────────────
+    elif data == "m:cash":
+        user = db_query("SELECT balance,level,last_cash FROM users WHERE user_id=?", (uid,), fetchone=True)
+        if not user:
+            return bot.answer_callback_query(call.id, "Введите /start")
+        bal, lv, last = user
+        now = time.time()
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:profile"))
+        if now - (last or 0) < 1800:
+            left = int(1800 - (now - last))
+            edit(f"⏳ *Казна пуста.*\nСледующий сбор через {left//60} мин. {left%60} сек.", kb)
+        else:
+            earned = int(500 * (1 + lv * 0.2) * (1 + get_tech(uid, 'finance') * 0.10) * random.uniform(0.8, 1.2))
+            db_query("UPDATE users SET balance=balance+?, last_cash=? WHERE user_id=?", (earned, now, uid))
+            edit(f"💵 *Налоги собраны!*\n+{earned:,} 💰\nБаланс: {bal+earned:,}", kb)
+
+    # ─── Улучшение экономики ─────────────────────────────────────
+    elif data == "m:upgrade":
+        user = db_query("SELECT balance,level FROM users WHERE user_id=?", (uid,), fetchone=True)
+        if not user: return bot.answer_callback_query(call.id, "Введите /start")
+        bal, lv = user
+        cost = lv * 3000
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:profile"))
+        if bal < cost:
+            edit(f"📈 *Улучшение экономики*\n\nТекущий уровень: {lv}\nСтоимость: {cost:,} 💰\nВаш баланс: {bal:,} 💰\n\n❌ Недостаточно средств.", kb)
+        else:
+            db_query("UPDATE users SET balance=balance-?, level=level+1 WHERE user_id=?", (cost, uid))
+            edit(f"✅ *Экономика улучшена!*\nУровень: {lv} → *{lv+1}*\nПотрачено: {cost:,} 💰", kb)
+
+    # ─── Мораль ──────────────────────────────────────────────────
+    elif data == "m:morale":
+        user = db_query("SELECT morale, troops, balance FROM users WHERE user_id=?", (uid,), fetchone=True)
+        if not user: return bot.answer_callback_query(call.id, "Введите /start")
+        morale, troops, bal = user
+        morale = morale or 100
+        logi = get_tech(uid, 'logistics')
+        maint = int((troops / 5) * max(0.1, 1 - logi * 0.10))
+        if   morale >= 90: status = "💚 Непобедимый дух"
+        elif morale >= 70: status = "🟢 Высокий боевой дух"
+        elif morale >= 50: status = "🟡 Нормальный дух"
+        elif morale >= 30: status = "🟠 Низкий дух - дезертирство"
+        elif morale >= 15: status = "🔴 Кризис морали"
+        else:              status = "☠️ Коллапс армии"
+        morale_tech = get_tech(uid, 'morale_tech')
+        text = (
+            f"🎺 *Мораль армии:*\n\n"
+            f"Мораль: *{morale}%* - {status}\n\n"
+            f"🪖 Пехота: {troops:,}\n"
+            f"💸 Содержание: ~{maint} 💰/ч\n"
+            f"💰 Баланс: {bal:,}\n\n"
+            f"*Как поднять мораль:*\n"
+            f"- Платить содержание армии\n"
+            f"- Снабжать едой (`/buy food`)\n"
+            f"- Технология Политработа Ур.{morale_tech}/5"
+        )
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:profile"))
+        edit(text, kb)
+
+    # ─── Журнал событий ──────────────────────────────────────────
+    elif data == "m:events":
+        rows = db_query('''SELECT event_type, description, created_at FROM event_log
+                           WHERE user_id=? ORDER BY created_at DESC LIMIT 10''', (uid,))
+        if not rows:
+            text = "📋 *Журнал событий:*\n\nСобытий нет."
+        else:
+            text = "📋 *Последние события:*\n\n"
+            for etype, desc, ts in rows:
+                dt = time.strftime('%d.%m %H:%M', time.localtime(ts))
+                icon = {'desertion': '🏃', 'hunger': '🍽️', 'crisis': '💥'}.get(etype, '📌')
+                text += f"{icon} [{dt}] {desc}\n"
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:profile"))
+        edit(text, kb)
+
+    # ─── Бизнесы ─────────────────────────────────────────────────
+    elif data == "m:biz":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🛒 Магазин бизнесов", callback_data="m:shop"),
+            types.InlineKeyboardButton("📋 Мои бизнесы",      callback_data="m:mybiz"),
+            types.InlineKeyboardButton("◀️ Назад",            callback_data="m:main"),
+        )
+        edit("🏢 *Бизнесы:*\nВыберите раздел:", kb)
+
+    elif data == "m:shop":
+        rows = db_query("SELECT name,display_name,cost,income_per_hour,description,ep_per_12h FROM business_types")
+        text = "🏪 *Магазин бизнесов:*\n\n"
+        for name, disp, cost, iph, desc, ep12 in rows:
+            ep_str = f" | 🔬+{ep12}ОЭ/12ч" if ep12 else ""
+            text += f"*{disp}*\n💰 {cost:,} | ~{iph}💰/ч{ep_str}\n_{desc}_\n`/buybiz {name} [кол-во]`\n\n"
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:biz"))
+        edit(text, kb)
+
+    elif data == "m:mybiz":
+        rows = db_query('''SELECT bt.display_name,ub.quantity,bt.income_per_hour,bt.ep_per_12h
+                           FROM user_businesses ub JOIN business_types bt ON ub.business_name=bt.name
+                           WHERE ub.user_id=?''', (uid,))
+        if not rows:
+            text = "🏢 *Мои бизнесы:*\n\nУ вас нет бизнесов.\n_Купить:_ `/buybiz [название]`"
+        else:
+            text = "🏢 *Мои бизнесы:*\n\n"
+            ti = te = 0
+            for disp, qty, iph, ep12 in rows:
+                si = iph * qty; se = ep12 * qty; ti += si; te += se
+                ep_str = f" | +{se}ОЭ" if se else ""
+                text += f"*{disp}* ×{qty} - {si}💰/ч{ep_str}\n"
+            text += f"\n📊 *~{ti}💰/ч | 🔬+{te}ОЭ/12ч*"
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:biz"))
+        edit(text, kb)
+
+    # ─── Биржа ───────────────────────────────────────────────────
+    elif data == "m:market":
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📊 Цены",       callback_data="m:prices"),
+            types.InlineKeyboardButton("💼 Портфель",   callback_data="m:portfolio"),
+            types.InlineKeyboardButton("◀️ Назад",      callback_data="m:main"),
+        )
+        edit("📊 *Биржа ресурсов:*\nВыберите раздел:", kb)
+
+    elif data == "m:prices":
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:market"))
+        edit(build_market_text(), kb)
+
+    elif data == "m:portfolio":
+        rows = db_query('''SELECT p.asset_name,p.quantity,p.avg_buy_price,m.price,m.display_name
+                           FROM user_portfolio p JOIN market_assets m ON p.asset_name=m.name
+                           WHERE p.user_id=? AND p.quantity>0''', (uid,))
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:market"))
+        if not rows:
+            edit("💼 *Портфель пуст.*\n\n_Покупка:_ `/buy [актив] [кол-во]`", kb)
+        else:
+            text = "💼 *Портфель:*\n\n"
+            ti = tc = 0.0
+            for _, qty, avg, cur, disp in rows:
+                inv = avg * qty; cv = cur * qty; pnl = cv - inv
+                ti += inv; tc += cv
+                e = "📈" if pnl >= 0 else "📉"
+                pstr = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+                text += f"{e} *{disp}* ×{qty:.1f} | avg:{avg:.2f}→{cur:.2f} | {pstr}💰\n"
+            tp = tc - ti
+            tstr = f"+{tp:.2f}" if tp >= 0 else f"{tp:.2f}"
+            text += f"\n{'📈' if tp>=0 else '📉'} *P&L: {tstr}💰*"
+            edit(text, kb)
+
+    # ─── Армия ───────────────────────────────────────────────────
+    elif data == "m:army":
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📋 Состав",         callback_data="m:armyinfo"),
+            types.InlineKeyboardButton("🪖 Призыв",         callback_data="m:draft"),
+            types.InlineKeyboardButton("🔫 Наземные",       callback_data="m:craft:ground"),
+            types.InlineKeyboardButton("✈️ Авиация",         callback_data="m:craft:air"),
+            types.InlineKeyboardButton("🚢 Флот",           callback_data="m:craft:navy"),
+            types.InlineKeyboardButton("🎺 Мораль",         callback_data="m:morale"),
+        )
+        kb.row(types.InlineKeyboardButton("◀️ Назад", callback_data="m:main"))
+        edit("⚔️ *Армия:*\nВыберите раздел:", kb)
+
+    elif data == "m:armyinfo":
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:army"))
+        edit(build_army_text(uid), kb)
+
+    elif data == "m:draft":
+        user = db_query("SELECT troops,last_draft,morale FROM users WHERE user_id=?", (uid,), fetchone=True)
+        if not user: return bot.answer_callback_query(call.id, "Введите /start")
+        troops, last, morale = user
+        now = time.time()
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:army"))
+        if now - (last or 0) < 7200:
+            left = int(7200 - (now - last))
+            edit(f"⏳ Следующий призыв через {left//3600}ч {(left%3600)//60}м.", kb)
+        else:
+            morale = morale or 100
+            morale_factor = max(0.3, morale / 100)
+            new_recruits = int(random.randint(1000, 2000) * morale_factor)
+            db_query("UPDATE users SET troops=troops+?, last_draft=? WHERE user_id=?", (new_recruits, now, uid))
+            note = f"\n⚠️ Низкая мораль ({morale}%) сократила призыв!" if morale < 60 else ""
+            edit(f"🪖 *Призыв!*\n+*{new_recruits}* новобранцев\nВсего: {troops+new_recruits:,}{note}", kb)
+
+    elif data.startswith("m:craft:"):
+        category = data.split(":")[2]
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:army"))
+        edit(build_craft_text(uid, category), kb)
+
+    # ─── Технологии ──────────────────────────────────────────────
+    elif data == "m:tech":
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:main"))
+        edit(build_tech_text(uid), kb)
+
+    # ─── Добыча ──────────────────────────────────────────────────
+    elif data == "m:extract":
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:main"))
+        edit(build_extract_text(uid), kb)
+
+    # ─── Торговля ────────────────────────────────────────────────
+    elif data == "m:trade":
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:main"))
+        text = build_trades_text()
+        text += "\n\n_Создать предложение:_\n`/trade тип что кол-во тип что кол-во`"
+        edit(text, kb)
+
+    # ─── Рейтинги ────────────────────────────────────────────────
+    elif data == "m:top":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("⚔️ Военный рейтинг", callback_data="m:toparmy"),
+            types.InlineKeyboardButton("◀️ Назад",            callback_data="m:main"),
+        )
+        edit(build_top_text(), kb)
+
+    elif data == "m:toparmy":
+        users = db_query("SELECT user_id,username FROM users WHERE banned=0")
+        powers = sorted([(uname, calc_power(u)) for u, uname in (users or [])], key=lambda x: x[1], reverse=True)
+        powers = [(u, p) for u, p in powers if p > 0][:10]
+        medals = ["🥇","🥈","🥉"]
+        text = "⚔️ *Рейтинг военной мощи:*\n\n"
+        for i, (u, p) in enumerate(powers, 1):
+            text += f"{medals[i-1] if i<=3 else str(i)+'.'} @{u} - {p:,}⚔️\n"
+        if not powers: text += "Пусто."
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:top"))
+        edit(text, kb)
+
+    # ─── Мировая статистика ──────────────────────────────────────
+    elif data == "m:world":
+        money   = (db_query("SELECT SUM(balance) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
+        troops  = (db_query("SELECT SUM(troops) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
+        count   = (db_query("SELECT COUNT(*) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
+        ep      = (db_query("SELECT SUM(ep) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
+        oil     = (db_query("SELECT SUM(quantity) FROM user_portfolio WHERE asset_name='oil'", fetchone=True) or [0])[0] or 0
+        trades  = (db_query("SELECT COUNT(*) FROM trade_offers WHERE status='open'", fetchone=True) or [0])[0] or 0
+        avg_m   = (db_query("SELECT AVG(morale) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
+        nps     = (db_query("SELECT COUNT(*) FROM user_businesses WHERE business_name='nps' AND quantity>0", fetchone=True) or [0])[0] or 0
+        miss    = (db_query("SELECT SUM(quantity) FROM user_military WHERE unit_name='missile'", fetchone=True) or [0])[0] or 0
+        nsubs   = (db_query("SELECT SUM(quantity) FROM user_military WHERE unit_name='nuclear_sub'", fetchone=True) or [0])[0] or 0
+        text = (
+            f"🌍 *Мировая статистика Аурелии:*\n\n"
+            f"👥 Правителей: {count}\n"
+            f"💰 Денег в мире: {money:,}💰\n"
+            f"🪖 Войск: {troops:,}\n"
+            f"🎺 Средняя мораль: {avg_m:.0f}%\n"
+            f"🔬 ОЭ: {ep:,}\n"
+            f"🛢️ Нефти: {oil:.1f}\n"
+            f"⚛️ АЭС в мире: {nps}\n"
+            f"☢️ Баллист. ракет: {int(miss or 0)}\n"
+            f"☢️ Атомных подлодок: {int(nsubs or 0)}\n"
+            f"🤝 Открытых сделок: {trades}"
+        )
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="m:main"))
+        edit(text, kb)
+
+    else:
+        bot.answer_callback_query(call.id)
+
+# ==============================================================
+# ТЕКСТОВЫЕ КОМАНДЫ (для прямого доступа + продвинутые операции)
+# ==============================================================
 @bot.message_handler(commands=['help'])
 @group_only
 def cmd_help(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
     bot.reply_to(message,
-        "📋 *Все команды Аурелии:*\n\n"
-        "👤 *Основные:*\n"
-        "/profile - профиль и статус\n"
-        "/cash - сбор налогов (30 мин)\n"
-        "/upgrade - улучшить уровень экономики\n"
-        "/pay @user сумма - перевести деньги\n"
-        "/senditem @user актив кол-во - передать ресурс\n"
-        "/events - лог событий\n\n"
-        "🏢 *Бизнес:*\n"
-        "/shop - магазин бизнесов\n"
-        "/buybiz название [кол-во] - купить бизнес\n"
-        "/mybiz - ваши бизнесы и доход\n\n"
-        "📊 *Биржа:*\n"
-        "/market - цены на ресурсы\n"
-        "/buy актив кол-во - купить\n"
-        "/sell актив кол-во - продать\n"
-        "/portfolio - ваш портфель\n\n"
-        "⚔️ *Военное дело:*\n"
-        "/army - состав армии и расходы\n"
-        "/draft - призыв пехоты (2ч)\n"
-        "/craft [тип] [кол-во] - производство техники\n"
-        "/giftunit @user тип кол-во - подарить технику\n"
-        "/morale - мораль армии\n\n"
-        "🔬 *Технологии:*\n"
-        "/tech - дерево технологий\n"
-        "/researchtech название - исследовать\n\n"
-        "⛏️ *Добыча:*\n"
-        "/extractoil - добыть нефть\n"
-        "/extract [gold|steel|coal|aur] - добыть ресурс\n\n"
-        "🤝 *Торговля:*\n"
-        "/trade тип что кол-во тип что кол-во\n"
-        "/trades - открытые предложения\n"
-        "/accept ID - принять сделку\n"
-        "/canceltrade ID - отменить сделку\n\n"
-        "🏆 *Рейтинги:*\n"
-        "/top - рейтинги по категориям\n"
-        "/toparmy - военная мощь\n"
-        "/worldstats - мировая статистика",
+        "📋 *Команды Аурелии:*\n\n"
+        "🎮 /menu - главное меню (рекомендуется)\n\n"
+        "👤 *Профиль:* /profile /cash /upgrade\n"
+        "💸 *Переводы:* `/pay @user сумма` | `/senditem @user актив кол`\n"
+        "🏢 *Бизнес:* `/buybiz название [кол]` | /mybiz\n"
+        "📊 *Биржа:* `/buy актив кол` | `/sell актив кол` | /portfolio\n"
+        "⚔️ *Армия:* /army | /draft | `/craft [тип] [кол]`\n"
+        "🎁 *Подарить:* `/giftunit @user тип кол`\n"
+        "🔬 *Техи:* /tech | `/researchtech название`\n"
+        "⛏️ *Добыча:* /extractoil | `/extract [gold|steel|coal|aur]`\n"
+        "🤝 *Торговля:* `/trade тип что кол тип что кол`\n"
+        "📋 *Сделки:* /trades | `/accept ID` | `/canceltrade ID`\n"
+        "🏆 *Рейтинги:* `/top [money|ep|oil|gold|...]` | /toparmy\n"
+        "📋 /events - журнал событий\n"
+        "🌍 /worldstats\n\n"
+        "*Активы:* oil gold steel aur food coal",
         parse_mode="Markdown")
 
 @bot.message_handler(commands=['profile'])
 @group_only
 def cmd_profile(message):
-    uid, uname = ensure_user(message)
+    uid, _ = ensure_user(message)
     if is_banned(uid): return
-    user = db_query("SELECT balance,level,troops,ep,morale FROM users WHERE user_id=?", (uid,), fetchone=True)
-    if not user: return bot.reply_to(message, "Введите /start")
-    bal, lv, troops, ep, morale = user
-    morale = morale or 100
-    iph = (db_query('''SELECT SUM(ub.quantity*bt.income_per_hour) FROM user_businesses ub
-                        JOIN business_types bt ON ub.business_name=bt.name WHERE ub.user_id=?''',
-                    (uid,), fetchone=True) or [0])[0] or 0
-    ext = (db_query("SELECT quantity FROM user_extractors WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-    power = calc_power(uid)
-    if bal >= 2_000_000:   tax_str = "3.5%/ч 🔴"
-    elif bal >= 1_000_000: tax_str = "3.0%/ч 🔴"
-    elif bal >= 500_000:   tax_str = "2.5%/ч 🟠"
-    elif bal >= 200_000:   tax_str = "2.0%/ч 🟠"
-    elif bal >= 150_000:   tax_str = "1.5%/ч 🟡"
-    elif bal >= 100_000:   tax_str = "1.0%/ч 🟡"
-    elif bal >= 50_000:    tax_str = "0.5%/ч 🟡"
-    else:                  tax_str = "нет ✅"
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("💵 Налоги",     callback_data="m:cash"),
+        types.InlineKeyboardButton("📈 Улучшить",   callback_data="m:upgrade"),
+    )
+    bot.reply_to(message, build_profile_text(uid), parse_mode="Markdown", reply_markup=kb)
 
-    if morale >= 80:   morale_str = f"{morale}% 💚"
-    elif morale >= 50: morale_str = f"{morale}% 🟡"
-    elif morale >= 25: morale_str = f"{morale}% 🟠 (угроза дезертирства)"
-    else:              morale_str = f"{morale}% 🔴 (КРИЗИС)"
+@bot.message_handler(commands=['cash'])
+@group_only
+def cmd_cash(message):
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    user = db_query("SELECT balance,level,last_cash FROM users WHERE user_id=?", (uid,), fetchone=True)
+    if not user: return bot.reply_to(message, "Введите /start или /menu")
+    bal, lv, last = user
+    now = time.time()
+    if now - (last or 0) < 1800:
+        left = int(1800 - (now - last))
+        return bot.reply_to(message, f"⏳ Казна пуста. Через {left//60} мин. {left%60} сек.")
+    earned = int(500 * (1 + lv*0.2) * (1 + get_tech(uid,'finance')*0.10) * random.uniform(0.8, 1.2))
+    db_query("UPDATE users SET balance=balance+?, last_cash=? WHERE user_id=?", (earned, now, uid))
+    bot.reply_to(message, f"💵 *+{earned:,}* 💰 в казну!\nБаланс: {bal+earned:,}", parse_mode="Markdown")
 
-    bot.reply_to(message,
-        f"👤 *@{uname}*\n\n"
-        f"💰 Баланс: {bal:,}\n"
-        f"💸 Налог: {tax_str}\n"
-        f"📈 Уровень экономики: {lv}\n"
-        f"🪖 Пехота: {troops:,}\n"
-        f"🎺 Мораль армии: {morale_str}\n"
-        f"⚔️ Военная мощь: {power:,}\n"
-        f"🏭 Пассивный доход: ~{iph} 💰/ч\n"
-        f"🔬 ОЭ: {ep}\n"
-        f"🛢️ Нефтекачек: {ext}\n\n"
-        f"Мораль влияет на военную мощь!",
-        parse_mode="Markdown")
+@bot.message_handler(commands=['upgrade'])
+@group_only
+def cmd_upgrade(message):
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    user = db_query("SELECT balance,level FROM users WHERE user_id=?", (uid,), fetchone=True)
+    if not user: return bot.reply_to(message, "Введите /menu")
+    bal, lv = user
+    cost = lv * 3000
+    if bal < cost: return bot.reply_to(message, f"Нужно {cost:,} 💰, у вас {bal:,}")
+    db_query("UPDATE users SET balance=balance-?, level=level+1 WHERE user_id=?", (cost, uid))
+    bot.reply_to(message, f"✅ Экономика - уровень *{lv+1}* за {cost:,} 💰!", parse_mode="Markdown")
 
 @bot.message_handler(commands=['morale'])
 @group_only
 def cmd_morale(message):
-    uid, uname = ensure_user(message)
+    uid, _ = ensure_user(message)
     if is_banned(uid): return
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🎮 Меню", callback_data="m:main"))
+    # Просто показываем через callback-текст через фейковый call - или напрямую собираем
     user = db_query("SELECT morale, troops, balance FROM users WHERE user_id=?", (uid,), fetchone=True)
-    if not user: return bot.reply_to(message, "Введите /start")
+    if not user: return
     morale, troops, bal = user
     morale = morale or 100
     logi = get_tech(uid, 'logistics')
     maint = int((troops / 5) * max(0.1, 1 - logi * 0.10))
-
-    if   morale >= 90: status = "Элитный дух - армия непобедима 💚"
-    elif morale >= 70: status = "Высокий дух - хорошая боеспособность 🟢"
-    elif morale >= 50: status = "Нормальный дух 🟡"
-    elif morale >= 30: status = "Низкий дух - начинается дезертирство 🟠"
-    elif morale >= 15: status = "Кризис морали - массовое дезертирство 🔴"
-    else:              status = "Коллапс - армия распадается ☠️"
-
+    if morale >= 90: status = "💚 Непобедимый дух"
+    elif morale >= 70: status = "🟢 Высокий боевой дух"
+    elif morale >= 50: status = "🟡 Нормальный"
+    elif morale >= 30: status = "🟠 Дезертирство"
+    elif morale >= 15: status = "🔴 Кризис"
+    else: status = "☠️ Коллапс"
     morale_tech = get_tech(uid, 'morale_tech')
-    desertion_rate = max(0.5, 3.0 - morale_tech * 0.5)
-
-    text = (
-        f"🎺 *Состояние вашей армии:*\n\n"
-        f"Мораль: *{morale}%*\n"
-        f"Статус: {status}\n\n"
-        f"🪖 Пехота: {troops:,}\n"
-        f"💸 Содержание: ~{maint} 💰/ч\n"
-        f"💰 Ваш баланс: {bal:,}\n\n"
-        f"*Как поднять мораль:*\n"
-        f"- Платить за содержание армии\n"
-        f"- Снабжать едой (/buy food)\n"
-        f"- Технология Политработа (/tech)\n"
-        f"  Текущий уровень: {morale_tech}/5\n\n"
-        f"*При нехватке денег:* -{desertion_rate:.1f}% войск/ч"
-    )
-    bot.reply_to(message, text, parse_mode="Markdown")
+    bot.reply_to(message,
+        f"🎺 *Мораль:* {morale}% - {status}\n\n"
+        f"🪖 Пехота: {troops:,} | 💸 Содержание: ~{maint}/ч\n"
+        f"Политработа: Ур.{morale_tech}/5\n\n"
+        f"Повышение: оплата армии + `/buy food`",
+        parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(commands=['events'])
 @group_only
@@ -678,43 +1103,13 @@ def cmd_events(message):
     if is_banned(uid): return
     rows = db_query('''SELECT event_type, description, created_at FROM event_log
                        WHERE user_id=? ORDER BY created_at DESC LIMIT 10''', (uid,))
-    if not rows:
-        return bot.reply_to(message, "У вас нет зарегистрированных событий.")
+    if not rows: return bot.reply_to(message, "Событий нет.")
     text = "📋 *Последние события:*\n\n"
     for etype, desc, ts in rows:
         dt = time.strftime('%d.%m %H:%M', time.localtime(ts))
-        icon = {'desertion': '🏃', 'hunger': '🍽️', 'crisis': '💥'}.get(etype, '📌')
+        icon = {'desertion': '🏃', 'hunger': '🍽️'}.get(etype, '📌')
         text += f"{icon} [{dt}] {desc}\n"
     bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['cash'])
-@group_only
-def cmd_cash(message):
-    uid, _ = ensure_user(message)
-    if is_banned(uid): return
-    user = db_query("SELECT balance,level,last_cash FROM users WHERE user_id=?", (uid,), fetchone=True)
-    if not user: return bot.reply_to(message, "Введите /start")
-    bal, lv, last = user
-    now = time.time()
-    if now - (last or 0) < 1800:
-        left = int(1800 - (now - last))
-        return bot.reply_to(message, f"Казна пуста. Через {left//60} мин. {left%60} сек.")
-    earned = int(500 * (1 + lv*0.2) * (1 + get_tech(uid,'finance')*0.10) * random.uniform(0.8, 1.2))
-    db_query("UPDATE users SET balance=balance+?, last_cash=? WHERE user_id=?", (earned, now, uid))
-    bot.reply_to(message, f"💵 Налоги: *+{earned}* 💰\nБаланс: {bal+earned:,}", parse_mode="Markdown")
-
-@bot.message_handler(commands=['upgrade'])
-@group_only
-def cmd_upgrade(message):
-    uid, _ = ensure_user(message)
-    if is_banned(uid): return
-    user = db_query("SELECT balance,level FROM users WHERE user_id=?", (uid,), fetchone=True)
-    if not user: return bot.reply_to(message, "Введите /start")
-    bal, lv = user
-    cost = lv * 3000
-    if bal < cost: return bot.reply_to(message, f"Нужно {cost:,} 💰, у вас {bal:,}")
-    db_query("UPDATE users SET balance=balance-?, level=level+1 WHERE user_id=?", (cost, uid))
-    bot.reply_to(message, f"✅ Экономика - уровень *{lv+1}* за {cost:,} 💰!", parse_mode="Markdown")
 
 # --- Нефтедобыча ---
 @bot.message_handler(commands=['extractoil'])
@@ -724,76 +1119,45 @@ def cmd_extractoil(message):
     if is_banned(uid): return
     ext = db_query("SELECT quantity,last_extract FROM user_extractors WHERE user_id=?", (uid,), fetchone=True)
     if not ext or ext[0] <= 0:
-        return bot.reply_to(message, "В вашей стране нет источника нефти.")
+        return bot.reply_to(message, "В вашей стране нет нефтекачек.")
     qty, last = ext
     now = time.time()
     if now - (last or 0) < 3600:
         left = int(3600 - (now - last))
-        return bot.reply_to(message, f"Следующая добыча через {left//60} мин. {left%60} сек.")
+        return bot.reply_to(message, f"⏳ Следующая добыча через {left//60} мин. {left%60} сек.")
     db_query("UPDATE user_extractors SET last_extract=? WHERE user_id=?", (now, uid))
     add_asset(uid, 'oil', qty)
-    total = (db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='oil'",
-                      (uid,), fetchone=True) or [0])[0]
-    bot.reply_to(message,
-        f"🛢️ Добыто *{qty}* нефти ({qty} качек x 1)\nВсего нефти: {total:.1f}",
-        parse_mode="Markdown")
+    total = (db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='oil'", (uid,), fetchone=True) or [0])[0]
+    bot.reply_to(message, f"🛢️ Добыто *{qty}* нефти\nВсего: {total:.1f}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['extract'])
 @group_only
 def cmd_extract(message):
-    """Добыча ресурсов из зданий: /extract gold|steel|coal|aur"""
     uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-
     if len(args) < 2:
-        text = "⛏️ *Добыча ресурсов:*\n\n"
-        for res, (emoji, name, yld, cd) in RESOURCE_BUILDINGS.items():
-            row = db_query("SELECT quantity,last_extract FROM user_resource_buildings WHERE user_id=? AND resource=?",
-                           (uid, res), fetchone=True)
-            qty = row[0] if row else 0
-            last = row[1] if row else 0
-            now = time.time()
-            if qty > 0:
-                if now - (last or 0) < cd:
-                    left = int(cd - (now - last))
-                    cd_str = f"{left//3600}ч {(left%3600)//60}м" if left >= 3600 else f"{left//60}м {left%60}с"
-                    ready = f"готово через {cd_str}"
-                else:
-                    ready = f"✅ готово! +{qty*yld} {emoji}"
-                text += f"{emoji} *{name}*: {qty} шт. - {ready}\n"
-            else:
-                text += f"{emoji} *{name}* (`/extract {res}`): нет зданий\n"
-        text += "\nИспользование: `/extract [ресурс]`"
-        return bot.reply_to(message, text, parse_mode="Markdown")
-
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⛏️ Открыть Добычу", callback_data="m:extract"))
+        return bot.reply_to(message, "Использование: `/extract [gold|steel|coal|aur]`", parse_mode="Markdown", reply_markup=kb)
     res = args[1].lower()
     if res not in RESOURCE_BUILDINGS:
-        return bot.reply_to(message,
-            f"Неизвестный ресурс. Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
-
+        return bot.reply_to(message, f"Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
     emoji, name, yld, cd = RESOURCE_BUILDINGS[res]
-    row = db_query("SELECT quantity,last_extract FROM user_resource_buildings WHERE user_id=? AND resource=?",
-                   (uid, res), fetchone=True)
+    row = db_query("SELECT quantity,last_extract FROM user_resource_buildings WHERE user_id=? AND resource=?", (uid, res), fetchone=True)
     if not row or row[0] <= 0:
-        return bot.reply_to(message, f"В вашей стране нет источника {name.lower()}.")
-
+        return bot.reply_to(message, f"В вашей стране нет {name}.")
     qty, last = row
     now = time.time()
     if now - (last or 0) < cd:
         left = int(cd - (now - last))
         cd_str = f"{left//3600}ч {(left%3600)//60}м" if left >= 3600 else f"{left//60}м {left%60}с"
-        return bot.reply_to(message, f"Следующая добыча через {cd_str}.")
-
+        return bot.reply_to(message, f"⏳ Следующая добыча через {cd_str}.")
     gained = qty * yld
-    db_query("UPDATE user_resource_buildings SET last_extract=? WHERE user_id=? AND resource=?",
-             (now, uid, res))
+    db_query("UPDATE user_resource_buildings SET last_extract=? WHERE user_id=? AND resource=?", (now, uid, res))
     add_asset(uid, res, gained)
-    total = (db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                      (uid, res), fetchone=True) or [0])[0]
-    bot.reply_to(message,
-        f"{emoji} Добыто *{gained}* ({qty} зданий x {yld})\nВсего {name.split()[0].lower()}: {total:.1f}",
-        parse_mode="Markdown")
+    total = (db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, res), fetchone=True) or [0])[0]
+    bot.reply_to(message, f"{emoji} Добыто *{gained}* ({qty} зд. ×{yld})\nВсего: {total:.1f}", parse_mode="Markdown")
 
 # --- Технологии ---
 @bot.message_handler(commands=['tech'])
@@ -801,15 +1165,9 @@ def cmd_extract(message):
 def cmd_tech(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
-    techs = db_query("SELECT name,display_name,max_level,ep_cost_per_level,description FROM tech_types")
-    ep = (db_query("SELECT ep FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-    text = f"🔬 *Дерево технологий*\n💡 Ваши ОЭ: {ep}\n\n"
-    for name, disp, maxlv, cost, desc in techs:
-        lv = get_tech(uid, name)
-        status = "✅ МАКС" if lv >= maxlv else f"Ур.{lv}/{maxlv} - {cost} ОЭ"
-        text += f"*{disp}* (`{name}`)\n_{desc}_\n{status}\n\n"
-    text += "- `/researchtech [название]`"
-    bot.reply_to(message, text, parse_mode="Markdown")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🎮 Меню", callback_data="m:tech"))
+    bot.reply_to(message, build_tech_text(uid), parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(commands=['researchtech'])
 @group_only
@@ -817,14 +1175,13 @@ def cmd_researchtech(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) < 2: return bot.reply_to(message, "Использование: /researchtech [название]")
+    if len(args) < 2: return bot.reply_to(message, "Использование: `/researchtech [название]`\nСписок: /tech", parse_mode="Markdown")
     tech_name = args[1].lower()
-    tech = db_query("SELECT display_name,max_level,ep_cost_per_level FROM tech_types WHERE name=?",
-                    (tech_name,), fetchone=True)
+    tech = db_query("SELECT display_name,max_level,ep_cost_per_level FROM tech_types WHERE name=?", (tech_name,), fetchone=True)
     if not tech: return bot.reply_to(message, f"Технология '{tech_name}' не найдена. /tech")
     disp, maxlv, cost = tech
     lv = get_tech(uid, tech_name)
-    if lv >= maxlv: return bot.reply_to(message, f"✅ *{disp}* уже максимальна.", parse_mode="Markdown")
+    if lv >= maxlv: return bot.reply_to(message, f"✅ *{disp}* уже максимальная.", parse_mode="Markdown")
     ep = (db_query("SELECT ep FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
     if ep < cost: return bot.reply_to(message, f"Нужно {cost} ОЭ, у вас {ep}")
     db_query("UPDATE users SET ep=ep-? WHERE user_id=?", (cost, uid))
@@ -832,36 +1189,41 @@ def cmd_researchtech(message):
         db_query("INSERT INTO user_tech VALUES (?,?,1)", (uid, tech_name))
     else:
         db_query("UPDATE user_tech SET level=level+1 WHERE user_id=? AND tech_name=?", (uid, tech_name))
-    bot.reply_to(message, f"🔬 *{disp}* - Ур. *{lv+1}/{maxlv}*\nПотрачено: {cost} ОЭ",
-                 parse_mode="Markdown")
+    bot.reply_to(message, f"🔬 *{disp}* - Ур.*{lv+1}/{maxlv}*\nПотрачено: {cost} ОЭ", parse_mode="Markdown")
 
 # --- Армия ---
+@bot.message_handler(commands=['army'])
+@group_only
+def cmd_army(message):
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🪖 Призыв",    callback_data="m:draft"),
+        types.InlineKeyboardButton("🎺 Мораль",    callback_data="m:morale"),
+        types.InlineKeyboardButton("🔫 Наземные",  callback_data="m:craft:ground"),
+        types.InlineKeyboardButton("✈️ Авиация",    callback_data="m:craft:air"),
+        types.InlineKeyboardButton("🚢 Флот",      callback_data="m:craft:navy"),
+    )
+    bot.reply_to(message, build_army_text(uid), parse_mode="Markdown", reply_markup=kb)
+
 @bot.message_handler(commands=['draft'])
 @group_only
 def cmd_draft(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
     user = db_query("SELECT troops,last_draft,morale FROM users WHERE user_id=?", (uid,), fetchone=True)
-    if not user: return bot.reply_to(message, "Введите /start")
+    if not user: return bot.reply_to(message, "Введите /menu")
     troops, last, morale = user
     now = time.time()
     if now - (last or 0) < 7200:
         left = int(7200 - (now - last))
-        return bot.reply_to(message, f"Следующий призыв через {left//3600} ч. {(left%3600)//60} мин.")
-
+        return bot.reply_to(message, f"⏳ Следующий призыв через {left//3600}ч {(left%3600)//60}мин.")
     morale = morale or 100
-    # Низкая мораль = меньше призывников
-    morale_factor = max(0.3, morale / 100)
-    base_recruits = random.randint(1000, 2000)
-    new_recruits = int(base_recruits * morale_factor)
-
+    new_recruits = int(random.randint(1000, 2000) * max(0.3, morale / 100))
     db_query("UPDATE users SET troops=troops+?, last_draft=? WHERE user_id=?", (new_recruits, now, uid))
-    morale_note = ""
-    if morale < 60:
-        morale_note = f"\n⚠️ Низкая мораль ({morale}%) сократила призыв!"
-    bot.reply_to(message,
-        f"🪖 *Призыв!*\n+*{new_recruits}* новобранцев\nВсего: {troops+new_recruits:,}{morale_note}",
-        parse_mode="Markdown")
+    note = f"\n⚠️ Низкая мораль ({morale}%) сократила призыв!" if morale < 60 else ""
+    bot.reply_to(message, f"🪖 *Призыв!* +*{new_recruits}* новобранцев\nВсего: {troops+new_recruits:,}{note}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['craft'])
 @group_only
@@ -871,182 +1233,169 @@ def cmd_craft(message):
     args = message.text.split()
 
     if len(args) < 3:
-        types = db_query("SELECT name,display_name,steel_cost,money_cost,category,oil_per_unit,coal_per_unit FROM military_types")
-        cats = {'ground': '🪖 Наземные силы', 'air': '✈️ Авиация', 'navy': '🚢 Флот'}
-        text = "⚙️ *Производство военной техники:* `/craft [тип] [кол-во]`\n\n"
-        for ck, cn in cats.items():
-            text += f"*{cn}:*\n"
-            for name, disp, steel, money, cat, oil_pu, coal_pu in types:
-                if cat != ck: continue
-                fuel_str = ""
-                if oil_pu > 0:  fuel_str = f" | 🛢️{oil_pu}/3ч"
-                if coal_pu > 0: fuel_str = f" | 🪨{coal_pu}/3ч"
-                req_str = ""
-                if name in UNIT_TECH_REQUIREMENTS:
-                    reqs = []
-                    for tname, tlv in UNIT_TECH_REQUIREMENTS[name]:
-                        trow = db_query("SELECT display_name FROM tech_types WHERE name=?", (tname,), fetchone=True)
-                        tdisp = trow[0].split()[-1] if trow else tname
-                        cur = get_tech(uid, tname)
-                        ok = "✅" if cur >= tlv else "❌"
-                        reqs.append(f"{ok}{tdisp}Ур.{tlv}")
-                    req_str = f" [{', '.join(reqs)}]"
-                extra_str = ""
-                if name in UNIT_RESOURCE_REQUIREMENTS:
-                    parts = [f"{v}{k}" for k, v in UNIT_RESOURCE_REQUIREMENTS[name].items()]
-                    extra_str = f" +{'/'.join(parts)}/ед."
-                text += f"  {disp} (`{name}`) - {steel}⚙️ + {money:,}💰{fuel_str}{extra_str}{req_str}\n"
-            text += "\n"
-        return bot.reply_to(message, text, parse_mode="Markdown")
+        kb = types.InlineKeyboardMarkup(row_width=3)
+        kb.add(
+            types.InlineKeyboardButton("🔫 Наземные", callback_data="m:craft:ground"),
+            types.InlineKeyboardButton("✈️ Авиация",   callback_data="m:craft:air"),
+            types.InlineKeyboardButton("🚢 Флот",      callback_data="m:craft:navy"),
+        )
+        return bot.reply_to(message, "⚙️ *Производство:* выберите категорию\nИли: `/craft [тип] [кол-во]`", parse_mode="Markdown", reply_markup=kb)
 
     unit_name = args[1].lower()
     try: qty = int(args[2])
     except: return bot.reply_to(message, "Количество - число.")
     if qty <= 0: return bot.reply_to(message, "Количество > 0.")
-    unit = db_query("SELECT display_name,steel_cost,money_cost FROM military_types WHERE name=?",
-                    (unit_name,), fetchone=True)
-    if not unit: return bot.reply_to(message, f"Тип '{unit_name}' не найден.")
+    unit = db_query("SELECT display_name,steel_cost,money_cost FROM military_types WHERE name=?", (unit_name,), fetchone=True)
+    if not unit: return bot.reply_to(message, f"Тип '{unit_name}' не найден. /craft")
     disp, steel_c, money_c = unit
 
-    # Проверка требований технологий
     if unit_name in UNIT_TECH_REQUIREMENTS:
         missing = []
-        for tech_name, min_lv in UNIT_TECH_REQUIREMENTS[unit_name]:
-            cur_lv = get_tech(uid, tech_name)
+        for tname, min_lv in UNIT_TECH_REQUIREMENTS[unit_name]:
+            cur_lv = get_tech(uid, tname)
             if cur_lv < min_lv:
-                tech_row = db_query("SELECT display_name FROM tech_types WHERE name=?", (tech_name,), fetchone=True)
-                tech_disp = tech_row[0] if tech_row else tech_name
-                missing.append(f"{tech_disp} Ур.{min_lv} (у вас: {cur_lv})")
+                td = db_query("SELECT display_name FROM tech_types WHERE name=?", (tname,), fetchone=True)
+                missing.append(f"{td[0] if td else tname} Ур.{min_lv} (у вас: {cur_lv})")
         if missing:
-            return bot.reply_to(message,
-                f"❌ Для производства *{disp}* нужно:\n" + "\n".join(f"- {m}" for m in missing),
-                parse_mode="Markdown")
-    total_steel = int(steel_c * qty * max(0.2, 1 - get_tech(uid,'metallurgy')*0.08))
-    total_money = int(money_c * qty * max(0.2, 1 - get_tech(uid,'engineering')*0.08))
-    bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-    sr = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='steel'",
-                  (uid,), fetchone=True)
-    cur_steel = int(sr[0]) if sr else 0
-    if bal < total_money or cur_steel < total_steel:
-        return bot.reply_to(message,
-            f"Нужно: {total_steel}⚙️ и {total_money:,}💰\nЕсть: {cur_steel}⚙️ и {bal:,}💰")
+            return bot.reply_to(message, f"❌ Требования для *{disp}*:\n" + "\n".join(f"- {m}" for m in missing), parse_mode="Markdown")
 
-    # Проверка доп. ресурсов для ядерного оружия
+    total_steel = int(steel_c * qty * max(0.2, 1 - get_tech(uid, 'metallurgy') * 0.08))
+    total_money = int(money_c * qty * max(0.2, 1 - get_tech(uid, 'engineering') * 0.08))
+    bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
+    sr = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='steel'", (uid,), fetchone=True)
+    cur_steel = int(sr[0]) if sr else 0
+
+    if bal < total_money or cur_steel < total_steel:
+        return bot.reply_to(message, f"Нужно: {total_steel}⚙️ + {total_money:,}💰\nЕсть: {cur_steel}⚙️ + {bal:,}💰")
+
     extra_needed = {}
     if unit_name in UNIT_RESOURCE_REQUIREMENTS:
         for asset, per_unit in UNIT_RESOURCE_REQUIREMENTS[unit_name].items():
             needed = per_unit * qty
-            row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                           (uid, asset), fetchone=True)
+            row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset), fetchone=True)
             have = row[0] if row else 0
             if have < needed:
-                arow = db_query("SELECT display_name FROM market_assets WHERE name=?", (asset,), fetchone=True)
-                aname = arow[0] if arow else asset
-                return bot.reply_to(message,
-                    f"❌ Ядерное производство: нужно *{needed}x {aname}*, у вас {have:.1f}",
-                    parse_mode="Markdown")
+                ar = db_query("SELECT display_name FROM market_assets WHERE name=?", (asset,), fetchone=True)
+                return bot.reply_to(message, f"❌ Ядерное: нужно *{needed}x {ar[0] if ar else asset}*, у вас {have:.1f}", parse_mode="Markdown")
             extra_needed[asset] = needed
 
     db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (total_money, uid))
-    db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name='steel'",
-             (total_steel, uid))
+    db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name='steel'", (total_steel, uid))
     for asset, needed in extra_needed.items():
-        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?",
-                 (needed, uid, asset))
-    db_query("INSERT INTO user_military VALUES (?,?,?) ON CONFLICT(user_id,unit_name) DO UPDATE SET quantity=quantity+?",
-             (uid, unit_name, qty, qty))
-    extra_str = ""
-    for asset, needed in extra_needed.items():
-        arow = db_query("SELECT display_name FROM market_assets WHERE name=?", (asset,), fetchone=True)
-        extra_str += f" | -{needed}x{arow[0] if arow else asset}"
-    bot.reply_to(message, f"🏭 *{qty}x {disp}* произведено!\n-{total_steel}⚙️ | -{total_money:,}💰{extra_str}",
-                 parse_mode="Markdown")
+        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?", (needed, uid, asset))
+    db_query("INSERT INTO user_military VALUES (?,?,?) ON CONFLICT(user_id,unit_name) DO UPDATE SET quantity=quantity+?", (uid, unit_name, qty, qty))
+    extra_str = " | ".join(f"-{v}x{k}" for k, v in extra_needed.items())
+    bot.reply_to(message, f"🏭 *{qty}× {disp}* произведено!\n-{total_steel}⚙️ | -{total_money:,}💰" + (f" | {extra_str}" if extra_str else ""), parse_mode="Markdown")
 
-@bot.message_handler(commands=['army'])
-@group_only
-def cmd_army(message):
-    uid, _ = ensure_user(message)
-    if is_banned(uid): return
-    user = db_query("SELECT troops, morale FROM users WHERE user_id=?", (uid,), fetchone=True)
-    if not user: return bot.reply_to(message, "Введите /start")
-    troops, morale = user
-    morale = morale or 100
-
-    units = db_query('''SELECT u.unit_name, m.display_name, u.quantity, m.category,
-                               m.oil_per_unit, m.coal_per_unit
-                        FROM user_military u JOIN military_types m ON u.unit_name=m.name
-                        WHERE u.user_id=? AND u.quantity>0''', (uid,))
-    secs = {'ground':[], 'air':[], 'navy':[]}
-    total_oil_3h = 0.0
-    total_coal_3h = 0.0
-    energy_mult = max(0.1, 1 - get_tech(uid,'energy') * 0.10)
-    has_aes = db_query("SELECT quantity FROM user_businesses WHERE user_id=? AND business_name='nps'",
-                       (uid,), fetchone=True)
-    nps_bonus = 0.25 if (has_aes and has_aes[0] > 0) else 0.0
-    fuel_mult = max(0.05, energy_mult - nps_bonus)
-
-    for uname, disp, qty, cat, oil_pu, coal_pu in (units or []):
-        secs.get(cat, secs['ground']).append(f"  {disp}: {qty:,}")
-        total_oil_3h  += oil_pu  * qty * fuel_mult
-        total_coal_3h += coal_pu * qty * fuel_mult
-
-    logi = get_tech(uid, 'logistics')
-    maint = int((troops/5) * max(0.1, 1 - logi * 0.10))
-    power = calc_power(uid)
-
-    text = f"⚔️ *Ваши вооруженные силы:*\n\n"
-    text += f"🪖 *Наземные:*\n  Пехота: {troops:,}\n"
-    text += ("\n".join(secs['ground'])+"\n") if secs['ground'] else "  Техника отсутствует\n"
-    text += "\n✈️ *Авиация:*\n"
-    text += ("\n".join(secs['air'])+"\n") if secs['air'] else "  Авиация отсутствует\n"
-    text += "\n🚢 *Флот:*\n"
-    text += ("\n".join(secs['navy'])+"\n") if secs['navy'] else "  Флот отсутствует\n"
-    text += f"\n⚔️ *Мощь: {power:,}*"
-    text += f" (мораль: {morale}%)\n"
-    text += f"💸 Содержание пехоты: ~{maint} 💰/ч\n"
-    if total_oil_3h > 0:
-        aes_note = " (⚛️ АЭС: -25%)" if nps_bonus > 0 else ""
-        text += f"🛢️ Расход нефти (авиация+танки): {total_oil_3h:.2f}/3ч{aes_note}\n"
-    if total_coal_3h > 0:
-        aes_note = " (⚛️ АЭС: -25%)" if nps_bonus > 0 else ""
-        text += f"🪨 Расход угля (флот): {total_coal_3h:.2f}/3ч{aes_note}\n"
-    text += "\n💡 /craft - производство | /giftunit - подарить | /morale - мораль"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-# --- Подарить оружие ---
 @bot.message_handler(commands=['giftunit'])
 @group_only
 def cmd_giftunit(message):
-    uid, uname = ensure_user(message)
+    uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) != 4:
-        return bot.reply_to(message,
-            "Использование: `/giftunit @user [тип] [кол-во]`\nПример: `/giftunit @ivan tank 5`",
-            parse_mode="Markdown")
+    if len(args) != 4: return bot.reply_to(message, "Использование: `/giftunit @user [тип] [кол-во]`", parse_mode="Markdown")
     t = find_user(args[1])
     if not t: return bot.reply_to(message, f"{args[1]} не найден.")
     unit_name = args[2].lower()
     try: qty = int(args[3])
     except: return bot.reply_to(message, "Количество - число.")
-    if qty <= 0: return bot.reply_to(message, "Количество > 0.")
-    if t[0] == uid: return bot.reply_to(message, "Нельзя дарить себе.")
+    if qty <= 0 or t[0] == uid: return bot.reply_to(message, "Нельзя.")
     unit = db_query("SELECT display_name FROM military_types WHERE name=?", (unit_name,), fetchone=True)
-    if not unit: return bot.reply_to(message, f"Тип '{unit_name}' не найден. /craft")
-    row = db_query("SELECT quantity FROM user_military WHERE user_id=? AND unit_name=?", (uid,unit_name), fetchone=True)
-    if not row or row[0] < qty:
-        return bot.reply_to(message, f"У вас только {row[0] if row else 0} {unit[0]}")
-    db_query("UPDATE user_military SET quantity=quantity-? WHERE user_id=? AND unit_name=?", (qty,uid,unit_name))
-    e = db_query("SELECT quantity FROM user_military WHERE user_id=? AND unit_name=?", (t[0],unit_name), fetchone=True)
-    if e:
-        db_query("UPDATE user_military SET quantity=quantity+? WHERE user_id=? AND unit_name=?", (qty,t[0],unit_name))
-    else:
-        db_query("INSERT INTO user_military VALUES (?,?,?)", (t[0],unit_name,qty))
-    bot.reply_to(message, f"🎁 *{qty}x {unit[0]}* подарено @{t[1]}!", parse_mode="Markdown")
+    if not unit: return bot.reply_to(message, f"Тип '{unit_name}' не найден.")
+    row = db_query("SELECT quantity FROM user_military WHERE user_id=? AND unit_name=?", (uid, unit_name), fetchone=True)
+    if not row or row[0] < qty: return bot.reply_to(message, f"У вас только {row[0] if row else 0} {unit[0]}")
+    db_query("UPDATE user_military SET quantity=quantity-? WHERE user_id=? AND unit_name=?", (qty, uid, unit_name))
+    e = db_query("SELECT quantity FROM user_military WHERE user_id=? AND unit_name=?", (t[0], unit_name), fetchone=True)
+    if e: db_query("UPDATE user_military SET quantity=quantity+? WHERE user_id=? AND unit_name=?", (qty, t[0], unit_name))
+    else: db_query("INSERT INTO user_military VALUES (?,?,?)", (t[0], unit_name, qty))
+    bot.reply_to(message, f"🎁 *{qty}× {unit[0]}* подарено @{t[1]}!", parse_mode="Markdown")
 
-# ==============================================================
-# --- ТОРГОВАЯ СИСТЕМА ---
-# ==============================================================
+# --- Биржа ---
+@bot.message_handler(commands=['market'])
+@group_only
+def cmd_market(message):
+    if is_banned(message.from_user.id): return
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("💼 Портфель",  callback_data="m:portfolio"),
+        types.InlineKeyboardButton("📊 Обновить",  callback_data="m:prices"),
+    )
+    bot.reply_to(message, build_market_text(), parse_mode="Markdown", reply_markup=kb)
+
+@bot.message_handler(commands=['buy'])
+@group_only
+def cmd_buy(message):
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    args = message.text.split()
+    if len(args) < 3: return bot.reply_to(message, "Использование: `/buy [актив] [кол-во]`\nАктивы: oil gold steel aur food coal", parse_mode="Markdown")
+    asset = args[1].lower()
+    try: qty = int(args[2])
+    except: return bot.reply_to(message, "Количество - число.")
+    if qty <= 0: return bot.reply_to(message, "Количество > 0.")
+    arow = db_query("SELECT display_name,price FROM market_assets WHERE name=?", (asset,), fetchone=True)
+    if not arow: return bot.reply_to(message, f"Актив '{asset}' не найден. /market")
+    disp, price = arow
+    total = round(price * qty, 2)
+    bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
+    if bal < total: return bot.reply_to(message, f"Нужно {total:.2f}💰, у вас {bal:,}💰")
+    e = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset), fetchone=True)
+    if e:
+        nq = e[0] + qty; na = (e[0] * e[1] + price * qty) / nq
+        db_query("UPDATE user_portfolio SET quantity=?,avg_buy_price=? WHERE user_id=? AND asset_name=?", (nq, na, uid, asset))
+    else:
+        db_query("INSERT INTO user_portfolio VALUES (?,?,?,?)", (uid, asset, qty, price))
+    db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (total, uid))
+    bot.reply_to(message, f"✅ *{qty}× {disp}* за {total:.2f}💰", parse_mode="Markdown")
+
+@bot.message_handler(commands=['sell'])
+@group_only
+def cmd_sell(message):
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    args = message.text.split()
+    if len(args) < 3: return bot.reply_to(message, "Использование: `/sell [актив] [кол-во]`", parse_mode="Markdown")
+    asset = args[1].lower()
+    try: qty = int(args[2])
+    except: return bot.reply_to(message, "Количество - число.")
+    if qty <= 0: return bot.reply_to(message, "Количество > 0.")
+    arow = db_query("SELECT display_name,price FROM market_assets WHERE name=?", (asset,), fetchone=True)
+    if not arow: return bot.reply_to(message, f"Актив '{asset}' не найден.")
+    disp, price = arow
+    row = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset), fetchone=True)
+    if not row or row[0] < qty: return bot.reply_to(message, f"У вас только {row[0] if row else 0:.1f} {disp}")
+    rev = round(price * qty, 2); profit = round((price - row[1]) * qty, 2)
+    nq = row[0] - qty
+    if nq <= 0: db_query("DELETE FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset))
+    else: db_query("UPDATE user_portfolio SET quantity=? WHERE user_id=? AND asset_name=?", (nq, uid, asset))
+    db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (rev, uid))
+    pstr = f"+{profit:.2f}" if profit >= 0 else f"{profit:.2f}"
+    bot.reply_to(message, f"💰 *{qty}× {disp}* → {rev:.2f}💰\n{'📈' if profit>=0 else '📉'} P&L: *{pstr}💰*", parse_mode="Markdown")
+
+@bot.message_handler(commands=['portfolio'])
+@group_only
+def cmd_portfolio(message):
+    uid, _ = ensure_user(message)
+    if is_banned(uid): return
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📊 Биржа", callback_data="m:prices"))
+    rows = db_query('''SELECT p.asset_name,p.quantity,p.avg_buy_price,m.price,m.display_name
+                       FROM user_portfolio p JOIN market_assets m ON p.asset_name=m.name
+                       WHERE p.user_id=? AND p.quantity>0''', (uid,))
+    if not rows: return bot.reply_to(message, "Портфель пуст. /market", reply_markup=kb)
+    text = "💼 *Портфель:*\n\n"
+    ti = tc = 0.0
+    for _, qty, avg, cur, disp in rows:
+        inv = avg * qty; cv = cur * qty; pnl = cv - inv; ti += inv; tc += cv
+        e = "📈" if pnl >= 0 else "📉"
+        pstr = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+        text += f"{e} *{disp}* ×{qty:.1f} | avg:{avg:.2f}→{cur:.2f} | {pstr}💰\n"
+    tp = tc - ti
+    tstr = f"+{tp:.2f}" if tp >= 0 else f"{tp:.2f}"
+    text += f"\n{'📈' if tp>=0 else '📉'} *P&L: {tstr}💰*"
+    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+
+# --- Торговля ---
 @bot.message_handler(commands=['trade'])
 @group_only
 def cmd_trade(message):
@@ -1056,13 +1405,11 @@ def cmd_trade(message):
     if len(args) != 7:
         return bot.reply_to(message,
             "📋 *Создать торговое предложение:*\n"
-            "`/trade [тип] [что] [кол-во] [тип] [что] [кол-во]`\n\n"
-            "*Типы:* `money` или `asset`\n"
-            "*Активы:* oil gold steel aur food coal\n\n"
+            "`/trade [тип] [что] [кол] [тип] [что] [кол]`\n\n"
+            "*Типы:* `money` или `asset`\n\n"
             "*Примеры:*\n"
             "`/trade asset steel 50 money money 5000`\n"
-            "`/trade money money 10000 asset gold 15`\n"
-            "`/trade asset oil 20 asset steel 100`",
+            "`/trade money money 10000 asset gold 15`",
             parse_mode="Markdown")
     _, ot, on, oq_s, wt, wn, wq_s = args
     ot = ot.lower(); wt = wt.lower()
@@ -1073,57 +1420,46 @@ def cmd_trade(message):
     if ot == 'money':
         on = 'money'
         bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-        if bal < int(oq): return bot.reply_to(message, f"Нужно {int(oq):,} 💰, у вас {bal:,}")
+        if bal < int(oq): return bot.reply_to(message, f"Нужно {int(oq):,}💰, у вас {bal:,}")
         db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (int(oq), uid))
     elif ot == 'asset':
         on = on.lower()
         if not db_query("SELECT name FROM market_assets WHERE name=?", (on,), fetchone=True):
             return bot.reply_to(message, f"Актив '{on}' не найден.")
-        row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid,on), fetchone=True)
+        row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, on), fetchone=True)
         if not row or row[0] < oq: return bot.reply_to(message, f"Недостаточно {on}")
-        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?", (oq,uid,on))
+        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?", (oq, uid, on))
     else:
         return bot.reply_to(message, "Тип: 'money' или 'asset'")
 
-    if wt == 'money':
-        wn = 'money'
+    if wt == 'money': wn = 'money'
     elif wt == 'asset':
         wn = wn.lower()
         if not db_query("SELECT name FROM market_assets WHERE name=?", (wn,), fetchone=True):
-            if ot == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq),uid))
-            else: db_query("UPDATE user_portfolio SET quantity=quantity+? WHERE user_id=? AND asset_name=?", (oq,uid,on))
+            if ot == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq), uid))
+            else: db_query("UPDATE user_portfolio SET quantity=quantity+? WHERE user_id=? AND asset_name=?", (oq, uid, on))
             return bot.reply_to(message, f"Актив '{wn}' не найден.")
     else:
-        if ot == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq),uid))
-        else: db_query("UPDATE user_portfolio SET quantity=quantity+? WHERE user_id=? AND asset_name=?", (oq,uid,on))
+        if ot == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq), uid))
+        else: db_query("UPDATE user_portfolio SET quantity=quantity+? WHERE user_id=? AND asset_name=?", (oq, uid, on))
         return bot.reply_to(message, "Тип: 'money' или 'asset'")
 
     db_query("INSERT INTO trade_offers (seller_id,seller_username,offer_type,offer_name,offer_qty,want_type,want_name,want_qty,created_at,status) VALUES (?,?,?,?,?,?,?,?,?,?)",
              (uid, uname, ot, on, oq, wt, wn, wq, time.time(), 'open'))
-    tid = db_query("SELECT id FROM trade_offers WHERE seller_id=? ORDER BY id DESC LIMIT 1",
-                   (uid,), fetchone=True)[0]
-    ostr = f"{int(oq):,} 💰" if ot=='money' else f"{oq} {on}"
-    wstr = f"{int(wq):,} 💰" if wt=='money' else f"{wq} {wn}"
-    bot.reply_to(message,
-        f"✅ *Предложение #{tid}*\nОтдаю: {ostr}\nХочу: {wstr}\n"
-        f"Все: /trades | Принять: `/accept {tid}`",
-        parse_mode="Markdown")
+    tid = db_query("SELECT id FROM trade_offers WHERE seller_id=? ORDER BY id DESC LIMIT 1", (uid,), fetchone=True)[0]
+    ostr = f"{int(oq):,}💰" if ot == 'money' else f"{oq} {on}"
+    wstr = f"{int(wq):,}💰" if wt == 'money' else f"{wq} {wn}"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📋 Все сделки", callback_data="m:trade"))
+    bot.reply_to(message, f"✅ *Предложение #{tid}*\nОтдаю: {ostr} → Хочу: {wstr}\n`/accept {tid}`", parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(commands=['trades'])
 @group_only
 def cmd_trades(message):
     if is_banned(message.from_user.id): return
-    offers = db_query('''SELECT id,seller_username,offer_type,offer_name,offer_qty,
-                                want_type,want_name,want_qty FROM trade_offers
-                         WHERE status='open' ORDER BY id DESC LIMIT 20''')
-    if not offers: return bot.reply_to(message, "Открытых предложений нет.")
-    text = "🤝 *Открытые торговые предложения:*\n\n"
-    for tid, seller, ot, on, oq, wt, wn, wq in offers:
-        ostr = f"{int(oq):,}💰" if ot=='money' else f"{oq} {on}"
-        wstr = f"{int(wq):,}💰" if wt=='money' else f"{wq} {wn}"
-        text += f"*#{tid}* @{seller}: {ostr} -> {wstr} `/accept {tid}`\n"
-    text += "\nОтменить: `/canceltrade ID`"
-    bot.reply_to(message, text, parse_mode="Markdown")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔄 Обновить", callback_data="m:trade"))
+    bot.reply_to(message, build_trades_text(), parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(commands=['accept'])
 @group_only
@@ -1131,7 +1467,7 @@ def cmd_accept(message):
     uid, uname = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) != 2: return bot.reply_to(message, "Использование: /accept [ID]")
+    if len(args) != 2: return bot.reply_to(message, "Использование: `/accept [ID]`", parse_mode="Markdown")
     try: tid = int(args[1])
     except: return bot.reply_to(message, "ID - число.")
     offer = db_query('''SELECT seller_id,seller_username,offer_type,offer_name,offer_qty,
@@ -1143,29 +1479,22 @@ def cmd_accept(message):
 
     if wt == 'money':
         bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-        if bal < int(wq): return bot.reply_to(message, f"Нужно {int(wq):,} 💰, у вас {bal:,}")
+        if bal < int(wq): return bot.reply_to(message, f"Нужно {int(wq):,}💰, у вас {bal:,}")
         db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (int(wq), uid))
     else:
-        row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid,wn), fetchone=True)
+        row = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, wn), fetchone=True)
         if not row or row[0] < wq: return bot.reply_to(message, f"Недостаточно {wn}")
-        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?", (wq,uid,wn))
+        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name=?", (wq, uid, wn))
 
-    if ot == 'money':
-        db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq), uid))
-    else:
-        add_asset(uid, on, oq)
-
-    if wt == 'money':
-        db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(wq), seller_id))
-    else:
-        add_asset(seller_id, wn, wq)
+    if ot == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq), uid))
+    else: add_asset(uid, on, oq)
+    if wt == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(wq), seller_id))
+    else: add_asset(seller_id, wn, wq)
 
     db_query("UPDATE trade_offers SET status='closed' WHERE id=?", (tid,))
-    ostr = f"{int(oq):,}💰" if ot=='money' else f"{oq} {on}"
-    wstr = f"{int(wq):,}💰" if wt=='money' else f"{wq} {wn}"
-    bot.reply_to(message,
-        f"✅ *Сделка #{tid} завершена!*\n@{uname} купил {ostr} у @{seller_uname} за {wstr}",
-        parse_mode="Markdown")
+    ostr = f"{int(oq):,}💰" if ot == 'money' else f"{oq} {on}"
+    wstr = f"{int(wq):,}💰" if wt == 'money' else f"{wq} {wn}"
+    bot.reply_to(message, f"✅ *Сделка #{tid}!*\n@{uname} купил {ostr} у @{seller_uname} за {wstr}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['canceltrade'])
 @group_only
@@ -1173,90 +1502,78 @@ def cmd_canceltrade(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) != 2: return bot.reply_to(message, "Использование: /canceltrade [ID]")
+    if len(args) != 2: return bot.reply_to(message, "Использование: `/canceltrade [ID]`", parse_mode="Markdown")
     try: tid = int(args[1])
     except: return bot.reply_to(message, "ID - число.")
-    offer = db_query("SELECT seller_id,offer_type,offer_name,offer_qty FROM trade_offers WHERE id=? AND status='open'",
-                     (tid,), fetchone=True)
+    offer = db_query("SELECT seller_id,offer_type,offer_name,offer_qty FROM trade_offers WHERE id=? AND status='open'", (tid,), fetchone=True)
     if not offer: return bot.reply_to(message, f"Предложение #{tid} не найдено.")
-    if offer[0] != uid and not is_admin(uid):
-        return bot.reply_to(message, "Это не ваше предложение.")
-    seller_id, ot, on, oq = offer
-    if ot == 'money':
-        db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq), seller_id))
-    else:
-        add_asset(seller_id, on, oq)
+    if offer[0] != uid and not is_admin(uid): return bot.reply_to(message, "Это не ваше предложение.")
+    sid, ot, on, oq = offer
+    if ot == 'money': db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (int(oq), sid))
+    else: add_asset(sid, on, oq)
     db_query("UPDATE trade_offers SET status='cancelled' WHERE id=?", (tid,))
     bot.reply_to(message, f"✅ Предложение #{tid} отменено, активы возвращены.")
 
-# ==============================================================
-# --- ПЕРЕВОДЫ ---
-# ==============================================================
+# --- Переводы ---
 @bot.message_handler(commands=['pay'])
 @group_only
 def cmd_pay(message):
-    uid, uname = ensure_user(message)
+    uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) != 3: return bot.reply_to(message, "Использование: /pay @user [сумма]")
+    if len(args) != 3: return bot.reply_to(message, "Использование: `/pay @user [сумма]`", parse_mode="Markdown")
     t = find_user(args[1])
     if not t: return bot.reply_to(message, f"{args[1]} не найден.")
     try: amount = int(args[2])
     except: return bot.reply_to(message, "Сумма - число.")
-    if amount <= 0: return bot.reply_to(message, "Сумма > 0.")
-    if t[0] == uid: return bot.reply_to(message, "Нельзя себе.")
+    if amount <= 0 or t[0] == uid: return bot.reply_to(message, "Нельзя.")
     bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
     if bal < amount: return bot.reply_to(message, "Недостаточно средств.")
     db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, uid))
     db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, t[0]))
-    bot.reply_to(message, f"💸 *{amount:,}* 💰 -> @{t[1]}", parse_mode="Markdown")
+    bot.reply_to(message, f"💸 *{amount:,}💰* → @{t[1]}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['senditem'])
 @group_only
 def cmd_senditem(message):
-    uid, uname = ensure_user(message)
+    uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) != 4:
-        return bot.reply_to(message, "Использование: `/senditem @user [актив] [кол-во]`", parse_mode="Markdown")
+    if len(args) != 4: return bot.reply_to(message, "Использование: `/senditem @user [актив] [кол-во]`", parse_mode="Markdown")
     t = find_user(args[1])
     if not t: return bot.reply_to(message, f"{args[1]} не найден.")
     asset = args[2].lower()
     try: amount = float(args[3])
     except: return bot.reply_to(message, "Количество - число.")
-    if amount <= 0: return bot.reply_to(message, "Количество > 0.")
-    if t[0] == uid: return bot.reply_to(message, "Нельзя себе.")
+    if amount <= 0 or t[0] == uid: return bot.reply_to(message, "Нельзя.")
     arow = db_query("SELECT display_name FROM market_assets WHERE name=?", (asset,), fetchone=True)
     if not arow: return bot.reply_to(message, f"Актив '{asset}' не найден.")
-    row = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                   (uid,asset), fetchone=True)
+    row = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset), fetchone=True)
     if not row or row[0] < amount: return bot.reply_to(message, f"Недостаточно {arow[0]}")
-    new_qty = row[0] - amount
-    if new_qty <= 0: db_query("DELETE FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid,asset))
-    else: db_query("UPDATE user_portfolio SET quantity=? WHERE user_id=? AND asset_name=?", (new_qty,uid,asset))
-    te = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                  (t[0],asset), fetchone=True)
+    nq = row[0] - amount
+    if nq <= 0: db_query("DELETE FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid, asset))
+    else: db_query("UPDATE user_portfolio SET quantity=? WHERE user_id=? AND asset_name=?", (nq, uid, asset))
+    te = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?", (t[0], asset), fetchone=True)
     if te:
-        new_avg = (te[0]*te[1] + amount*row[1]) / (te[0]+amount)
-        db_query("UPDATE user_portfolio SET quantity=quantity+?, avg_buy_price=? WHERE user_id=? AND asset_name=?",
-                 (amount, new_avg, t[0], asset))
+        new_avg = (te[0] * te[1] + amount * row[1]) / (te[0] + amount)
+        db_query("UPDATE user_portfolio SET quantity=quantity+?, avg_buy_price=? WHERE user_id=? AND asset_name=?", (amount, new_avg, t[0], asset))
     else:
-        db_query("INSERT INTO user_portfolio VALUES (?,?,?,?)", (t[0],asset,amount,row[1]))
-    bot.reply_to(message, f"📦 *{amount}x {arow[0]}* -> @{t[1]}", parse_mode="Markdown")
+        db_query("INSERT INTO user_portfolio VALUES (?,?,?,?)", (t[0], asset, amount, row[1]))
+    bot.reply_to(message, f"📦 *{amount}× {arow[0]}* → @{t[1]}", parse_mode="Markdown")
 
-# ==============================================================
-# --- БИЗНЕС ---
-# ==============================================================
+# --- Бизнес ---
 @bot.message_handler(commands=['shop'])
 @group_only
 def cmd_shop(message):
     if is_banned(message.from_user.id): return
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🏢 Мои бизнесы", callback_data="m:mybiz"))
     rows = db_query("SELECT name,display_name,cost,income_per_hour,description,ep_per_12h FROM business_types")
     text = "🏪 *Магазин бизнесов:*\n\n"
     for name, disp, cost, iph, desc, ep12 in rows:
         ep_str = f" | 🔬+{ep12}ОЭ/12ч" if ep12 else ""
-        text += f"{disp}\n💵 {cost:,}💰 | ~{iph}💰/ч{ep_str}\n_{desc}_\n`/buybiz {name}`\n\n"
-    bot.reply_to(message, text, parse_mode="Markdown")
+        text += f"*{disp}* - {cost:,}💰 | ~{iph}💰/ч{ep_str}\n_{desc}_\n`/buybiz {name} [кол-во]`\n\n"
+    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(commands=['buybiz'])
 @group_only
@@ -1264,201 +1581,75 @@ def cmd_buybiz(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
     args = message.text.split()
-    if len(args) < 2: return bot.reply_to(message, "Использование: /buybiz [название] [кол-во]")
+    if len(args) < 2: return bot.reply_to(message, "Использование: `/buybiz [название] [кол-во]`\nМагазин: /shop", parse_mode="Markdown")
     bname = args[1].lower()
     qty = int(args[2]) if len(args) >= 3 and args[2].isdigit() else 1
     if qty < 1: return bot.reply_to(message, "Количество >= 1.")
-    biz = db_query("SELECT display_name,cost,income_per_hour,ep_per_12h FROM business_types WHERE name=?",
-                   (bname,), fetchone=True)
+    biz = db_query("SELECT display_name,cost,income_per_hour,ep_per_12h FROM business_types WHERE name=?", (bname,), fetchone=True)
     if not biz: return bot.reply_to(message, f"Бизнес '{bname}' не найден. /shop")
     disp, cost, iph, ep12 = biz
 
-    # Особая обработка АЭС
     if bname == 'nps':
         energy_lv = get_tech(uid, 'energy')
         if energy_lv < 3:
-            return bot.reply_to(message,
-                f"⚛️ АЭС требует технологию *Энергетика Ур.3* (у вас: {energy_lv}).\n"
-                f"Исследуйте: /tech -> /researchtech energy",
-                parse_mode="Markdown")
-        existing = db_query("SELECT quantity FROM user_businesses WHERE user_id=? AND business_name='nps'",
-                            (uid,), fetchone=True)
+            return bot.reply_to(message, f"⚛️ АЭС требует *Энергетика Ур.3* (у вас: {energy_lv}).", parse_mode="Markdown")
+        existing = db_query("SELECT quantity FROM user_businesses WHERE user_id=? AND business_name='nps'", (uid,), fetchone=True)
         if existing and existing[0] >= 1:
-            return bot.reply_to(message, "⚛️ У вашей страны уже есть АЭС. Только одна на государство.")
-        steel_needed, aur_needed = 500, 20
+            return bot.reply_to(message, "⚛️ У вашей страны уже есть АЭС.")
         sr = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='steel'", (uid,), fetchone=True)
         ar = db_query("SELECT quantity FROM user_portfolio WHERE user_id=? AND asset_name='aur'", (uid,), fetchone=True)
         cur_steel = int(sr[0]) if sr else 0
         cur_aur = float(ar[0]) if ar else 0.0
         bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-        if bal < cost or cur_steel < steel_needed or cur_aur < aur_needed:
-            return bot.reply_to(message,
-                f"⚛️ *Строительство АЭС требует:*\n"
-                f"💰 {cost:,} (у вас: {bal:,})\n"
-                f"⚙️ {steel_needed} стали (у вас: {cur_steel})\n"
-                f"💎 {aur_needed} аурита (у вас: {cur_aur:.1f})",
-                parse_mode="Markdown")
+        if bal < cost or cur_steel < 500 or cur_aur < 20:
+            return bot.reply_to(message, f"⚛️ *АЭС требует:*\n💰 {cost:,} (у вас: {bal:,})\n⚙️ 500 стали (у вас: {cur_steel})\n💎 20 аурита (у вас: {cur_aur:.1f})", parse_mode="Markdown")
         db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (cost, uid))
-        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name='steel'", (steel_needed, uid))
-        db_query("UPDATE user_portfolio SET quantity=quantity-? WHERE user_id=? AND asset_name='aur'", (aur_needed, uid))
-        db_query("INSERT INTO user_businesses (user_id,business_name,quantity) VALUES (?,?,1) "
-                 "ON CONFLICT(user_id,business_name) DO UPDATE SET quantity=quantity+1", (uid, bname))
-        bot.reply_to(message,
-            f"⚛️ *АЭС построена!*\n"
-            f"-{cost:,}💰 | -{steel_needed}⚙️ | -{aur_needed}💎\n\n"
-            f"💵 Доход: ~{iph:,}💰/ч\n"
-            f"⚡ Расход топлива армии снижен на 25%",
-            parse_mode="Markdown")
+        db_query("UPDATE user_portfolio SET quantity=quantity-500 WHERE user_id=? AND asset_name='steel'", (uid,))
+        db_query("UPDATE user_portfolio SET quantity=quantity-20 WHERE user_id=? AND asset_name='aur'", (uid,))
+        db_query("INSERT INTO user_businesses (user_id,business_name,quantity) VALUES (?,?,1) ON CONFLICT(user_id,business_name) DO UPDATE SET quantity=quantity+1", (uid, bname))
+        bot.reply_to(message, f"⚛️ *АЭС построена!*\n-{cost:,}💰 | -500⚙️ | -20💎\n💵 {iph:,}💰/ч | ⚡ -25% расход топлива армии", parse_mode="Markdown")
         return
+
     total = cost * qty
     bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
     if bal < total: return bot.reply_to(message, f"Нужно {total:,}💰, у вас {bal:,}💰")
     db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (total, uid))
-    db_query("INSERT INTO user_businesses (user_id,business_name,quantity) VALUES (?,?,?) ON CONFLICT(user_id,business_name) DO UPDATE SET quantity=quantity+?",
-             (uid, bname, qty, qty))
-    ep_str = f"\n🔬 +{ep12*qty} ОЭ/12ч" if ep12 else ""
-    bot.reply_to(message, f"✅ *{qty}x {disp}* за {total:,}💰!\n~{iph*qty}💰/ч{ep_str}",
-                 parse_mode="Markdown")
+    db_query("INSERT INTO user_businesses (user_id,business_name,quantity) VALUES (?,?,?) ON CONFLICT(user_id,business_name) DO UPDATE SET quantity=quantity+?", (uid, bname, qty, qty))
+    ep_str = f"\n🔬 +{ep12*qty}ОЭ/12ч" if ep12 else ""
+    bot.reply_to(message, f"✅ *{qty}× {disp}* за {total:,}💰!\n~{iph*qty}💰/ч{ep_str}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['mybiz'])
 @group_only
 def cmd_mybiz(message):
     uid, _ = ensure_user(message)
     if is_banned(uid): return
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🛒 Магазин", callback_data="m:shop"))
     rows = db_query('''SELECT bt.display_name,ub.quantity,bt.income_per_hour,bt.ep_per_12h
                        FROM user_businesses ub JOIN business_types bt ON ub.business_name=bt.name
                        WHERE ub.user_id=?''', (uid,))
-    if not rows: return bot.reply_to(message, "У вас нет бизнесов. /shop")
-    text = "🏢 *Ваши бизнесы:*\n\n"
+    if not rows: return bot.reply_to(message, "У вас нет бизнесов.\n/shop - купить", reply_markup=kb)
+    text = "🏢 *Мои бизнесы:*\n\n"
     ti = te = 0
     for disp, qty, iph, ep12 in rows:
-        si=iph*qty; se=ep12*qty; ti+=si; te+=se
+        si = iph * qty; se = ep12 * qty; ti += si; te += se
         ep_str = f" | +{se}ОЭ" if se else ""
-        text += f"{disp} x{qty} - {si}💰/ч{ep_str}\n"
-    text += f"\n📊 *~{ti}💰/ч | 🔬+{te}ОЭ/12ч | ~{ti*24:,}💰/сутки*"
-    bot.reply_to(message, text, parse_mode="Markdown")
+        text += f"*{disp}* ×{qty} - {si}💰/ч{ep_str}\n"
+    text += f"\n📊 *~{ti}💰/ч | 🔬+{te}ОЭ/12ч | ~{ti*24:,}💰/сут*"
+    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
 
-# ==============================================================
-# --- БИРЖА ---
-# ==============================================================
-@bot.message_handler(commands=['market'])
-@group_only
-def cmd_market(message):
-    if is_banned(message.from_user.id): return
-    assets = db_query("SELECT name,display_name,price,base_price FROM market_assets")
-    text = "📊 *Мировая биржа:*\n\n"
-    for name, disp, price, base in assets:
-        arr = get_price_arrow(price, base)
-        pct = ((price-base)/base)*100
-        sign = "+" if pct >= 0 else ""
-        text += f"{arr} *{disp}*: {price:.2f}💰 ({sign}{pct:.1f}%)\n"
-        text += f"   `/buy {name} [кол]`  `/sell {name} [кол]`\n\n"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['buy'])
-@group_only
-def cmd_buy(message):
-    uid, _ = ensure_user(message)
-    if is_banned(uid): return
-    args = message.text.split()
-    if len(args) < 3: return bot.reply_to(message, "Использование: /buy [актив] [кол-во]")
-    asset = args[1].lower()
-    try: qty = int(args[2])
-    except: return bot.reply_to(message, "Количество - число.")
-    if qty <= 0: return bot.reply_to(message, "Количество > 0.")
-    arow = db_query("SELECT display_name,price FROM market_assets WHERE name=?", (asset,), fetchone=True)
-    if not arow: return bot.reply_to(message, f"Актив '{asset}' не найден.")
-    disp, price = arow
-    total = round(price * qty, 2)
-    bal = (db_query("SELECT balance FROM users WHERE user_id=?", (uid,), fetchone=True) or [0])[0]
-    if bal < total: return bot.reply_to(message, f"Нужно {total:.2f}💰, у вас {bal:,}💰")
-    e = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                 (uid,asset), fetchone=True)
-    if e:
-        nq = e[0]+qty; na = (e[0]*e[1]+price*qty)/nq
-        db_query("UPDATE user_portfolio SET quantity=?,avg_buy_price=? WHERE user_id=? AND asset_name=?",
-                 (nq,na,uid,asset))
-    else:
-        db_query("INSERT INTO user_portfolio VALUES (?,?,?,?)", (uid,asset,qty,price))
-    db_query("UPDATE users SET balance=balance-? WHERE user_id=?", (total, uid))
-    bot.reply_to(message, f"✅ *{qty}x {disp}* за {total:.2f}💰", parse_mode="Markdown")
-
-@bot.message_handler(commands=['sell'])
-@group_only
-def cmd_sell(message):
-    uid, _ = ensure_user(message)
-    if is_banned(uid): return
-    args = message.text.split()
-    if len(args) < 3: return bot.reply_to(message, "Использование: /sell [актив] [кол-во]")
-    asset = args[1].lower()
-    try: qty = int(args[2])
-    except: return bot.reply_to(message, "Количество - число.")
-    if qty <= 0: return bot.reply_to(message, "Количество > 0.")
-    arow = db_query("SELECT display_name,price FROM market_assets WHERE name=?", (asset,), fetchone=True)
-    if not arow: return bot.reply_to(message, f"Актив '{asset}' не найден.")
-    disp, price = arow
-    row = db_query("SELECT quantity,avg_buy_price FROM user_portfolio WHERE user_id=? AND asset_name=?",
-                   (uid,asset), fetchone=True)
-    if not row or row[0] < qty:
-        return bot.reply_to(message, f"У вас только {row[0] if row else 0:.1f} {disp}")
-    rev = round(price*qty, 2); profit = round((price-row[1])*qty, 2)
-    nq = row[0]-qty
-    if nq <= 0: db_query("DELETE FROM user_portfolio WHERE user_id=? AND asset_name=?", (uid,asset))
-    else: db_query("UPDATE user_portfolio SET quantity=? WHERE user_id=? AND asset_name=?", (nq,uid,asset))
-    db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (rev, uid))
-    emoji = "📈" if profit >= 0 else "📉"
-    pstr = f"+{profit:.2f}" if profit >= 0 else f"{profit:.2f}"
-    bot.reply_to(message, f"💰 *{qty}x {disp}* за {rev:.2f}💰\n{emoji} P&L: *{pstr}💰*",
-                 parse_mode="Markdown")
-
-@bot.message_handler(commands=['portfolio'])
-@group_only
-def cmd_portfolio(message):
-    uid, _ = ensure_user(message)
-    if is_banned(uid): return
-    rows = db_query('''SELECT p.asset_name,p.quantity,p.avg_buy_price,m.price,m.display_name
-                       FROM user_portfolio p JOIN market_assets m ON p.asset_name=m.name
-                       WHERE p.user_id=? AND p.quantity>0''', (uid,))
-    if not rows: return bot.reply_to(message, "Портфель пуст. /market")
-    text = "💼 *Портфель:*\n\n"
-    ti = tc = 0.0
-    for _, qty, avg, cur, disp in rows:
-        inv=avg*qty; cv=cur*qty; pnl=cv-inv; ti+=inv; tc+=cv
-        e = "📈" if pnl>=0 else "📉"
-        pstr = f"+{pnl:.2f}" if pnl>=0 else f"{pnl:.2f}"
-        text += f"{e} *{disp}* x{qty:.1f} | avg:{avg:.2f}->{cur:.2f} | {pstr}💰\n"
-    tp=tc-ti; tstr=f"+{tp:.2f}" if tp>=0 else f"{tp:.2f}"
-    text += f"\n💰 Вложено: {ti:.2f} | Сейчас: {tc:.2f}\n{'📈' if tp>=0 else '📉'} *P&L: {tstr}💰*"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-# ==============================================================
-# --- РЕЙТИНГИ ---
-# ==============================================================
-@bot.message_handler(commands=['toparmy'])
-@group_only
-def cmd_toparmy(message):
-    users = db_query("SELECT user_id,username FROM users WHERE banned=0")
-    powers = sorted([(uname, calc_power(uid)) for uid,uname in (users or [])],
-                    key=lambda x: x[1], reverse=True)
-    powers = [(u,p) for u,p in powers if p > 0][:10]
-    if not powers: return bot.reply_to(message, "Рейтинг пуст.")
-    medals = ["🥇","🥈","🥉"]
-    text = "⚔️ *Рейтинг военной мощи:*\n\n"
-    for i,(u,p) in enumerate(powers,1):
-        text += f"{medals[i-1] if i<=3 else str(i)+'.'} @{u} - {p:,}⚔️\n"
-    text += "\n💡 Мощь = войска + техника x коэффициент x мораль x технологии"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
+# --- Рейтинги ---
 @bot.message_handler(commands=['top'])
 @group_only
 def cmd_top(message):
     args = message.text.split()
     if len(args) < 2:
-        assets = db_query("SELECT name,display_name FROM market_assets")
-        text = "🏆 *Рейтинги:*\n`/top money` `/top ep`\n"
-        for name, disp in assets: text += f"`/top {name}` - {disp}\n"
-        text += "\n⚔️ /toparmy"
-        return bot.reply_to(message, text, parse_mode="Markdown")
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("💰 Баланс",   callback_data="m:top"),
+            types.InlineKeyboardButton("⚔️ Армия",     callback_data="m:toparmy"),
+        )
+        return bot.reply_to(message, build_top_text(), parse_mode="Markdown", reply_markup=kb)
     cat = args[1].lower()
     if cat == 'money':
         rows = db_query("SELECT username,balance FROM users WHERE banned=0 ORDER BY balance DESC LIMIT 10")
@@ -1467,7 +1658,7 @@ def cmd_top(message):
     elif cat == 'ep':
         rows = db_query("SELECT username,ep FROM users WHERE banned=0 ORDER BY ep DESC LIMIT 10")
         text = "🏆 *Топ по ОЭ:*\n\n"
-        for i,(u,v) in enumerate(rows or [],1): text += f"{i}. @{u} - {v:,}ОЭ🔬\n"
+        for i,(u,v) in enumerate(rows or [],1): text += f"{i}. @{u} - {v:,}🔬\n"
     else:
         arow = db_query("SELECT display_name FROM market_assets WHERE name=?", (cat,), fetchone=True)
         if not arow: return bot.reply_to(message, f"Категория '{cat}' не найдена.")
@@ -1479,6 +1670,19 @@ def cmd_top(message):
         for i,(u,v) in enumerate(rows or [],1): text += f"{i}. @{u} - {v:.1f}\n"
     bot.reply_to(message, text or "Рейтинг пуст.", parse_mode="Markdown")
 
+@bot.message_handler(commands=['toparmy'])
+@group_only
+def cmd_toparmy(message):
+    users = db_query("SELECT user_id,username FROM users WHERE banned=0")
+    powers = sorted([(uname, calc_power(uid)) for uid, uname in (users or [])], key=lambda x: x[1], reverse=True)
+    powers = [(u, p) for u, p in powers if p > 0][:10]
+    medals = ["🥇","🥈","🥉"]
+    text = "⚔️ *Рейтинг военной мощи:*\n\n"
+    for i,(u,p) in enumerate(powers,1):
+        text += f"{medals[i-1] if i<=3 else str(i)+'.'} @{u} - {p:,}⚔️\n"
+    if not powers: text += "Рейтинг пуст."
+    bot.reply_to(message, text, parse_mode="Markdown")
+
 @bot.message_handler(commands=['worldstats'])
 @group_only
 def cmd_worldstats(message):
@@ -1488,61 +1692,40 @@ def cmd_worldstats(message):
     ep     = (db_query("SELECT SUM(ep) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
     oil    = (db_query("SELECT SUM(quantity) FROM user_portfolio WHERE asset_name='oil'", fetchone=True) or [0])[0] or 0
     trades = (db_query("SELECT COUNT(*) FROM trade_offers WHERE status='open'", fetchone=True) or [0])[0] or 0
-    avg_morale = (db_query("SELECT AVG(morale) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
-    nps_count = (db_query("SELECT COUNT(*) FROM user_businesses WHERE business_name='nps' AND quantity>0", fetchone=True) or [0])[0] or 0
-    missiles = (db_query("SELECT SUM(quantity) FROM user_military WHERE unit_name='missile'", fetchone=True) or [0])[0] or 0
-    nucsubs  = (db_query("SELECT SUM(quantity) FROM user_military WHERE unit_name='nuclear_sub'", fetchone=True) or [0])[0] or 0
+    avg_m  = (db_query("SELECT AVG(morale) FROM users WHERE banned=0", fetchone=True) or [0])[0] or 0
+    nps    = (db_query("SELECT COUNT(*) FROM user_businesses WHERE business_name='nps' AND quantity>0", fetchone=True) or [0])[0] or 0
+    miss   = (db_query("SELECT SUM(quantity) FROM user_military WHERE unit_name='missile'", fetchone=True) or [0])[0] or 0
+    nsubs  = (db_query("SELECT SUM(quantity) FROM user_military WHERE unit_name='nuclear_sub'", fetchone=True) or [0])[0] or 0
     bot.reply_to(message,
-        f"🌍 *Мировая статистика Аурелии:*\n\n"
-        f"👥 Правителей: {count}\n"
-        f"💰 Денег в мире: {money:,}💰\n"
-        f"🪖 Войск: {troops:,}\n"
-        f"🎺 Средняя мораль: {avg_morale:.0f}%\n"
-        f"🔬 ОЭ: {ep:,}\n"
-        f"🛢️ Нефти: {oil:.1f}\n"
-        f"⚛️ АЭС в мире: {nps_count}\n"
-        f"☢️ Баллистических ракет: {int(missiles or 0)}\n"
-        f"☢️ Атомных подлодок: {int(nucsubs or 0)}\n"
-        f"🤝 Открытых сделок: {trades}",
+        f"🌍 *Мировая статистика:*\n\n"
+        f"👥 Правителей: {count}\n💰 Денег: {money:,}💰\n"
+        f"🪖 Войск: {troops:,}\n🎺 Средняя мораль: {avg_m:.0f}%\n"
+        f"🔬 ОЭ: {ep:,}\n🛢️ Нефти: {oil:.1f}\n"
+        f"⚛️ АЭС: {nps}\n☢️ Ракет: {int(miss or 0)}\n"
+        f"☢️ Атомных подлодок: {int(nsubs or 0)}\n🤝 Сделок: {trades}",
         parse_mode="Markdown")
 
 # ==============================================================
-# --- ADMIN ---
+# ADMIN КОМАНДЫ
 # ==============================================================
 @bot.message_handler(commands=['adminhelp'])
 @admin_only
 def cmd_adminhelp(message):
     bot.reply_to(message,
-        "🔧 *Команды администратора:*\n\n"
-        "💰 /givemoney @u сумма\n"
-        "💰 /takemoney @u сумма\n"
-        "🔬 /giveep @u кол-во\n"
-        "📦 /giveitem @u актив кол-во\n"
-        "📦 /takeitem @u актив кол-во\n"
-        "🛢️ /giveextractor @u кол-во\n"
-        "🛢️ /takeextractor @u кол-во\n"
-        "⛏️ /givebuilding @u [gold|steel|coal|aur] кол-во\n"
-        "⛏️ /takebuilding @u [gold|steel|coal|aur] кол-во\n"
-        "⚔️ /givemilitary @u тип кол-во\n"
-        "📈 /setlevel @u уровень\n"
-        "🪖 /settroops @u кол-во\n"
-        "🎺 /setmorale @u процент\n"
-        "🔬 /settech @u тех уровень\n"
-        "🚫 /banuser @u | /unbanuser @u\n"
-        "🗑️ /wipeuser @u\n"
-        "📋 /playerinfo @u\n"
-        "📊 /setprice актив цена\n"
-        "📊 /setbaseprice актив цена\n"
-        "⚡ /marketevent актив %\n"
-        "📉 /marketcrash | 📈 /marketboom | 🔄 /resetmarket\n"
-        "🤝 /canceltrade ID\n"
-        "📢 /broadcast текст\n"
-        "📢 /announcement текст\n\n"
-        "*Активы:* oil gold steel aur food coal\n"
-        "*Техника:* rifle machinegun mortar apc tank\n"
-        "artillery aa\\_gun mlrs missile\n"
-        "plane bomber helicopter bomb\n"
-        "corvette ship submarine cruiser carrier nuclear\\_sub",
+        "🔧 *Администрирование:*\n\n"
+        "/givemoney /takemoney @u сумма\n"
+        "/giveep @u кол-во\n"
+        "/giveitem /takeitem @u актив кол\n"
+        "/giveextractor /takeextractor @u кол\n"
+        "/givebuilding /takebuilding @u [gold|steel|coal|aur] кол\n"
+        "/givemilitary @u тип кол\n"
+        "/setlevel /settroops /setmorale /settech @u ...\n"
+        "/banuser /unbanuser /wipeuser @u\n"
+        "/playerinfo @u\n"
+        "/setprice /setbaseprice актив цена\n"
+        "/marketevent актив %\n"
+        "/marketcrash | /marketboom | /resetmarket\n"
+        "/broadcast /announcement текст",
         parse_mode="Markdown")
 
 @bot.message_handler(commands=['givemoney'])
@@ -1579,7 +1762,7 @@ def cmd_giveep(message):
     try: a = int(args[2])
     except: return bot.reply_to(message, "Количество - число.")
     db_query("UPDATE users SET ep=ep+? WHERE user_id=?", (a, t[0]))
-    bot.reply_to(message, f"✅ @{t[1]} +{a}ОЭ🔬")
+    bot.reply_to(message, f"✅ @{t[1]} +{a}🔬ОЭ")
 
 @bot.message_handler(commands=['giveitem'])
 @admin_only
@@ -1594,7 +1777,7 @@ def cmd_giveitem(message):
     if not db_query("SELECT name FROM market_assets WHERE name=?", (asset,), fetchone=True):
         return bot.reply_to(message, f"Актив '{asset}' не найден.")
     add_asset(t[0], asset, a)
-    bot.reply_to(message, f"✅ @{t[1]} +{a}x{asset}")
+    bot.reply_to(message, f"✅ @{t[1]} +{a}×{asset}")
 
 @bot.message_handler(commands=['takeitem'])
 @admin_only
@@ -1606,9 +1789,8 @@ def cmd_takeitem(message):
     asset = args[2].lower()
     try: a = float(args[3])
     except: return bot.reply_to(message, "Количество - число.")
-    db_query("UPDATE user_portfolio SET quantity=MAX(0,quantity-?) WHERE user_id=? AND asset_name=?",
-             (a, t[0], asset))
-    bot.reply_to(message, f"✅ @{t[1]} -{a}x{asset}")
+    db_query("UPDATE user_portfolio SET quantity=MAX(0,quantity-?) WHERE user_id=? AND asset_name=?", (a, t[0], asset))
+    bot.reply_to(message, f"✅ @{t[1]} -{a}×{asset}")
 
 @bot.message_handler(commands=['giveextractor'])
 @admin_only
@@ -1622,7 +1804,7 @@ def cmd_giveextractor(message):
     e = db_query("SELECT quantity FROM user_extractors WHERE user_id=?", (t[0],), fetchone=True)
     if e: db_query("UPDATE user_extractors SET quantity=quantity+? WHERE user_id=?", (a, t[0]))
     else: db_query("INSERT INTO user_extractors VALUES (?,?,?)", (t[0], a, 0))
-    bot.reply_to(message, f"✅ @{t[1]} +{a}🛢️качек")
+    bot.reply_to(message, f"✅ @{t[1]} +{a}🛢️")
 
 @bot.message_handler(commands=['takeextractor'])
 @admin_only
@@ -1634,46 +1816,41 @@ def cmd_takeextractor(message):
     try: a = int(args[2])
     except: return bot.reply_to(message, "Количество - число.")
     db_query("UPDATE user_extractors SET quantity=MAX(0,quantity-?) WHERE user_id=?", (a, t[0]))
-    bot.reply_to(message, f"✅ @{t[1]} -{a}🛢️качек")
+    bot.reply_to(message, f"✅ @{t[1]} -{a}🛢️")
 
 @bot.message_handler(commands=['givebuilding'])
 @admin_only
 def cmd_givebuilding(message):
-    """Выдать ресурсное здание: /givebuilding @user [gold|steel|coal|aur] кол-во"""
     args = message.text.split()
     if len(args) != 4: return bot.reply_to(message, "/givebuilding @user [gold|steel|coal|aur] кол-во")
     t = find_user(args[1])
     if not t: return bot.reply_to(message, "Не найден.")
     res = args[2].lower()
     if res not in RESOURCE_BUILDINGS:
-        return bot.reply_to(message, f"Ресурс '{res}' не поддерживается. Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
+        return bot.reply_to(message, f"Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
     try: a = int(args[3])
     except: return bot.reply_to(message, "Количество - число.")
     emoji, name, _, _ = RESOURCE_BUILDINGS[res]
-    e = db_query("SELECT quantity FROM user_resource_buildings WHERE user_id=? AND resource=?", (t[0],res), fetchone=True)
-    if e:
-        db_query("UPDATE user_resource_buildings SET quantity=quantity+? WHERE user_id=? AND resource=?", (a,t[0],res))
-    else:
-        db_query("INSERT INTO user_resource_buildings VALUES (?,?,?,?)", (t[0],res,a,0))
-    bot.reply_to(message, f"✅ @{t[1]} +{a}x {emoji}{name}")
+    e = db_query("SELECT quantity FROM user_resource_buildings WHERE user_id=? AND resource=?", (t[0], res), fetchone=True)
+    if e: db_query("UPDATE user_resource_buildings SET quantity=quantity+? WHERE user_id=? AND resource=?", (a, t[0], res))
+    else: db_query("INSERT INTO user_resource_buildings VALUES (?,?,?,?)", (t[0], res, a, 0))
+    bot.reply_to(message, f"✅ @{t[1]} +{a}×{emoji}{name}")
 
 @bot.message_handler(commands=['takebuilding'])
 @admin_only
 def cmd_takebuilding(message):
-    """Забрать ресурсное здание: /takebuilding @user [gold|steel|coal|aur] кол-во"""
     args = message.text.split()
     if len(args) != 4: return bot.reply_to(message, "/takebuilding @user [gold|steel|coal|aur] кол-во")
     t = find_user(args[1])
     if not t: return bot.reply_to(message, "Не найден.")
     res = args[2].lower()
     if res not in RESOURCE_BUILDINGS:
-        return bot.reply_to(message, f"Ресурс '{res}' не поддерживается.")
+        return bot.reply_to(message, f"Доступно: {', '.join(RESOURCE_BUILDINGS.keys())}")
     try: a = int(args[3])
     except: return bot.reply_to(message, "Количество - число.")
     emoji, name, _, _ = RESOURCE_BUILDINGS[res]
-    db_query("UPDATE user_resource_buildings SET quantity=MAX(0,quantity-?) WHERE user_id=? AND resource=?",
-             (a, t[0], res))
-    bot.reply_to(message, f"✅ @{t[1]} -{a}x {emoji}{name}")
+    db_query("UPDATE user_resource_buildings SET quantity=MAX(0,quantity-?) WHERE user_id=? AND resource=?", (a, t[0], res))
+    bot.reply_to(message, f"✅ @{t[1]} -{a}×{emoji}{name}")
 
 @bot.message_handler(commands=['givemilitary'])
 @admin_only
@@ -1687,17 +1864,17 @@ def cmd_givemilitary(message):
     except: return bot.reply_to(message, "Количество - число.")
     un = db_query("SELECT display_name FROM military_types WHERE name=?", (unit,), fetchone=True)
     if not un: return bot.reply_to(message, f"Тип '{unit}' не найден.")
-    e = db_query("SELECT quantity FROM user_military WHERE user_id=? AND unit_name=?", (t[0],unit), fetchone=True)
-    if e: db_query("UPDATE user_military SET quantity=quantity+? WHERE user_id=? AND unit_name=?", (a,t[0],unit))
-    else: db_query("INSERT INTO user_military VALUES (?,?,?)", (t[0],unit,a))
-    bot.reply_to(message, f"✅ @{t[1]} +{a}x{un[0]}")
+    e = db_query("SELECT quantity FROM user_military WHERE user_id=? AND unit_name=?", (t[0], unit), fetchone=True)
+    if e: db_query("UPDATE user_military SET quantity=quantity+? WHERE user_id=? AND unit_name=?", (a, t[0], unit))
+    else: db_query("INSERT INTO user_military VALUES (?,?,?)", (t[0], unit, a))
+    bot.reply_to(message, f"✅ @{t[1]} +{a}×{un[0]}")
 
 @bot.message_handler(commands=['setlevel'])
 @admin_only
 def cmd_setlevel(message):
     args = message.text.split()
     if len(args) != 3: return bot.reply_to(message, "/setlevel @user уровень")
-    t = find_user(args[1])
+    t = find_user(args[1]);
     if not t: return bot.reply_to(message, "Не найден.")
     try: lv = int(args[2])
     except: return bot.reply_to(message, "Уровень - число.")
@@ -1720,12 +1897,11 @@ def cmd_settroops(message):
 @admin_only
 def cmd_setmorale(message):
     args = message.text.split()
-    if len(args) != 3: return bot.reply_to(message, "/setmorale @user процент (1-100)")
+    if len(args) != 3: return bot.reply_to(message, "/setmorale @user процент")
     t = find_user(args[1])
     if not t: return bot.reply_to(message, "Не найден.")
-    try: val = int(args[2])
+    try: val = max(1, min(100, int(args[2])))
     except: return bot.reply_to(message, "Процент - число.")
-    val = max(1, min(100, val))
     db_query("UPDATE users SET morale=? WHERE user_id=?", (val, t[0]))
     bot.reply_to(message, f"✅ @{t[1]} мораль={val}%")
 
@@ -1742,10 +1918,10 @@ def cmd_settech(message):
     td = db_query("SELECT display_name,max_level FROM tech_types WHERE name=?", (tech,), fetchone=True)
     if not td: return bot.reply_to(message, f"Технология '{tech}' не найдена.")
     lv = max(0, min(lv, td[1]))
-    e = db_query("SELECT level FROM user_tech WHERE user_id=? AND tech_name=?", (t[0],tech), fetchone=True)
-    if e: db_query("UPDATE user_tech SET level=? WHERE user_id=? AND tech_name=?", (lv,t[0],tech))
-    else: db_query("INSERT INTO user_tech VALUES (?,?,?)", (t[0],tech,lv))
-    bot.reply_to(message, f"✅ @{t[1]} {td[0]} - Ур.{lv}")
+    e = db_query("SELECT level FROM user_tech WHERE user_id=? AND tech_name=?", (t[0], tech), fetchone=True)
+    if e: db_query("UPDATE user_tech SET level=? WHERE user_id=? AND tech_name=?", (lv, t[0], tech))
+    else: db_query("INSERT INTO user_tech VALUES (?,?,?)", (t[0], tech, lv))
+    bot.reply_to(message, f"✅ @{t[1]} {td[0]} Ур.{lv}")
 
 @bot.message_handler(commands=['banuser'])
 @admin_only
@@ -1776,9 +1952,9 @@ def cmd_wipeuser(message):
     if not t: return bot.reply_to(message, "Не найден.")
     tid = t[0]
     db_query("UPDATE users SET balance=1000,level=1,troops=0,ep=0,last_cash=0,last_draft=0,morale=100 WHERE user_id=?", (tid,))
-    for tbl in ['user_businesses','user_portfolio','user_military','user_tech','user_extractors']:
+    for tbl in ['user_businesses','user_portfolio','user_military','user_tech','user_extractors','user_resource_buildings']:
         db_query(f"DELETE FROM {tbl} WHERE user_id=?", (tid,))
-    bot.reply_to(message, f"✅ @{t[1]} полностью сброшен.")
+    bot.reply_to(message, f"✅ @{t[1]} сброшен.")
 
 @bot.message_handler(commands=['playerinfo'])
 @admin_only
@@ -1795,7 +1971,7 @@ def cmd_playerinfo(message):
     tstr = ", ".join(f"{n}:{l}" for n,l in techs) if techs else "нет"
     bot.reply_to(message,
         f"📋 *[ADMIN] @{uname}*\n"
-        f"ID:`{uid}` | Бан:{'Да' if user[4] else 'Нет'}\n"
+        f"ID: `{uid}` | Бан: {'Да' if user[4] else 'Нет'}\n"
         f"💰{user[0]:,} | 📈Ур.{user[1]} | 🪖{user[2]:,}\n"
         f"🎺Мораль:{user[5]}% | ⚔️Мощь:{power:,}\n"
         f"🔬ОЭ:{user[3]} | 🛢️Качек:{ext}\n"
@@ -1813,7 +1989,7 @@ def cmd_setprice(message):
     if not db_query("SELECT name FROM market_assets WHERE name=?", (asset,), fetchone=True):
         return bot.reply_to(message, f"'{asset}' не найден.")
     db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (p, time.time(), asset))
-    bot.reply_to(message, f"✅ {asset} - {p:.2f}💰")
+    bot.reply_to(message, f"✅ {asset} = {p:.2f}💰")
 
 @bot.message_handler(commands=['setbaseprice'])
 @admin_only
@@ -1826,7 +2002,7 @@ def cmd_setbaseprice(message):
     if not db_query("SELECT name FROM market_assets WHERE name=?", (asset,), fetchone=True):
         return bot.reply_to(message, f"'{asset}' не найден.")
     db_query("UPDATE market_assets SET base_price=? WHERE name=?", (p, asset))
-    bot.reply_to(message, f"✅ {asset} базовая - {p:.2f}💰")
+    bot.reply_to(message, f"✅ {asset} базовая = {p:.2f}💰")
 
 @bot.message_handler(commands=['marketevent'])
 @admin_only
@@ -1839,12 +2015,10 @@ def cmd_marketevent(message):
     row = db_query("SELECT display_name,price FROM market_assets WHERE name=?", (asset,), fetchone=True)
     if not row: return bot.reply_to(message, f"'{asset}' не найден.")
     disp, old = row
-    new_p = round(max(0.01, old*(1+pct/100)), 2)
+    new_p = round(max(0.01, old * (1 + pct / 100)), 2)
     db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (new_p, time.time(), asset))
     arr = "📈" if pct >= 0 else "📉"
-    bot.reply_to(message,
-        f"⚡ *{arr} {disp}*: {old:.2f} -> *{new_p:.2f}* ({'+' if pct>=0 else ''}{pct:.1f}%)",
-        parse_mode="Markdown")
+    bot.reply_to(message, f"⚡ {arr} *{disp}*: {old:.2f} → *{new_p:.2f}* ({'+' if pct>=0 else ''}{pct:.1f}%)", parse_mode="Markdown")
 
 @bot.message_handler(commands=['marketcrash'])
 @admin_only
@@ -1853,9 +2027,9 @@ def cmd_marketcrash(message):
     text = "🔴 *ОБВАЛ РЫНКА!*\n\n"
     for name, disp, price in assets:
         drop = random.uniform(0.20, 0.50)
-        new = round(price*(1-drop), 2)
-        db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (new,time.time(),name))
-        text += f"📉 {disp}: {price:.2f} -> *{new:.2f}* (-{drop*100:.1f}%)\n"
+        new = round(price * (1 - drop), 2)
+        db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (new, time.time(), name))
+        text += f"📉 {disp}: {price:.2f} → *{new:.2f}* (-{drop*100:.1f}%)\n"
     bot.reply_to(message, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['marketboom'])
@@ -1865,9 +2039,9 @@ def cmd_marketboom(message):
     text = "🟢 *БУМ НА РЫНКЕ!*\n\n"
     for name, disp, price in assets:
         rise = random.uniform(0.20, 0.50)
-        new = round(price*(1+rise), 2)
-        db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (new,time.time(),name))
-        text += f"📈 {disp}: {price:.2f} -> *{new:.2f}* (+{rise*100:.1f}%)\n"
+        new = round(price * (1 + rise), 2)
+        db_query("UPDATE market_assets SET price=?,last_updated=? WHERE name=?", (new, time.time(), name))
+        text += f"📈 {disp}: {price:.2f} → *{new:.2f}* (+{rise*100:.1f}%)\n"
     bot.reply_to(message, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['resetmarket'])
@@ -1881,7 +2055,7 @@ def cmd_resetmarket(message):
 def cmd_broadcast(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2: return bot.reply_to(message, "/broadcast текст")
-    text = f"📢 *Объявление от Администрации:*\n\n{args[1]}"
+    text = f"📢 *Объявление:*\n\n{args[1]}"
     for gid in ALLOWED_GROUP_IDS:
         try: bot.send_message(gid, text, parse_mode="Markdown")
         except Exception as e: print(f"Broadcast err {gid}: {e}")
@@ -1896,5 +2070,14 @@ def cmd_announcement(message):
     bot.reply_to(message, "✅ Готово.")
 
 # ==============================================================
-print("🌍 Aurelia Bot v4 запущен!")
-bot.polling(none_stop=True)
+# ЗАПУСК
+# ==============================================================
+print("🌍 Aurelia Bot v5 запускается...")
+try:
+    set_commands()
+    print("✅ Команды зарегистрированы в Telegram")
+except Exception as e:
+    print(f"⚠️ Не удалось зарегистрировать команды: {e}")
+
+print("🚀 Бот запущен!")
+bot.polling(none_stop=True, timeout=30)
