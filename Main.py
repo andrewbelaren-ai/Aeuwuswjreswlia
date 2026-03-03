@@ -49,33 +49,7 @@ def admin_only(func):
     return wrapper
 
 # ==============================================================
-# НОЧНОЙ РЕЖИМ
-# ==============================================================
-NIGHT_START = (0, 30)   # 00:30
-NIGHT_END   = (0, 31)    # 08:00
-
-BOT_PAUSED = False      # глобальная заморозка (admin /pause)
-NIGHT_DISABLED = False  # ручное отключение ночного режима (admin /nightoff)
-
-def is_night():
-    if NIGHT_DISABLED:
-        return False
-    import datetime
-    # Время по МСК (UTC+3)
-    now = datetime.datetime.utcnow() + datetime.timedelta(hours=3)
-    t = (now.hour, now.minute)
-    if NIGHT_START <= t or t < NIGHT_END:
-        return True
-    return False
-
-def night_check(func):
-    @functools.wraps(func)
-    def wrapper(message):
-        if is_night() and not is_admin(message.from_user.id):
-            bot.reply_to(message, "🌙 *AURELIA BOT V2* уходит на ночной отдых.\nВозобновление работы в 08:00 по МСК.")
-            return
-        func(message)
-    return wrapper
+# 
 
 # ==============================================================
 # БД
